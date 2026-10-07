@@ -602,7 +602,7 @@ final class NativeAttentionTests: XCTestCase {
                 let url = try oversizedHistory(root, middle: middle, ending: ending)
                 var data = try Data(contentsOf: url)
                 if invalid == "missingStart" {
-                    let records = data.split(separator: UInt8(10)).map(Data.init)
+                    let records: [Data] = data.split(separator: UInt8(10))
                     var removed = 0
                     data = Data()
                     for record in records {

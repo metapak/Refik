@@ -11,7 +11,10 @@ final class TerminalNavigationDiagnosticTests: XCTestCase {
     }
     private func rows(_ root: URL) throws -> [Data] {
         try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "jsonl" }.flatMap { try Data(contentsOf: $0).split(separator: UInt8(10)).map(Data.init) }
+            .filter { $0.pathExtension == "jsonl" }.flatMap { url in
+                let records: [Data] = try Data(contentsOf: url).split(separator: UInt8(10))
+                return records
+            }
     }
     func testDefaultOffPrivateSchemaBoundCapAndExpiry() throws {
         let root = try root(); defer { try? FileManager.default.removeItem(at: root) }
