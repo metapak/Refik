@@ -62,12 +62,14 @@ final class InteractionPresentationTests: XCTestCase {
         session.provider = .antigravity
         session.runtime = RuntimeMetadata(id: "verified-ide", host: .antigravity)
         let route = SessionRouting.route(for:session)
-        XCTAssertEqual(route.bundleID,"com.google.antigravity-ide")
+        let installed = try XCTUnwrap(EditorFocusHost.installations.first { $0.name == "Antigravity IDE" })
+        let verified = EditorFocusHost.verified(installed)
+        XCTAssertEqual(installed.bundleID, "com.google.antigravity-ide")
+        XCTAssertEqual(route.bundleID, verified ? installed.bundleID : "")
         XCTAssertFalse(route.exact)
         XCTAssertNil(route.url)
         XCTAssertEqual(route.label,"Uygulamayı aç")
-        let installed = try XCTUnwrap(EditorFocusHost.installations.first { $0.name == "Antigravity IDE" })
-        XCTAssertEqual(route.applicationURL, EditorFocusHost.verified(installed) ? installed.application : nil)
+        XCTAssertEqual(route.applicationURL, verified ? installed.application : nil)
         session.provider = .opencode
         session.runtime = RuntimeMetadata(id:"runtime",host:.antigravity)
         let hosted = SessionRouting.route(for:session)

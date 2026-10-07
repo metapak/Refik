@@ -235,7 +235,7 @@ final class FirstLaunchSetupTests: XCTestCase {
         XCTAssertNotNil(EditorFocusInstaller.adoptionProof(root: extensions, archive: archive))
         let host = EditorFocusHost.installations[0]
         try JSONEncoder().encode(["/Applications/Other.app": "foreign-receipt"]).write(to: receipts)
-        let result = EditorFocusInstaller.configure(enabled: true, archive: archive, receiptURL: receipts, installations: [host], verified: { _ in true }, runner: { _, args in XCTAssertEqual(args, ["--list-extensions", "--show-versions"]); return .init(success: true, output: "refik.editor-focus@0.1.0") }, extensionRoot: { _ in extensions })
+        let result = EditorFocusInstaller.configure(enabled: true, archive: archive, receiptURL: receipts, installations: [host], verified: { _ in true }, runner: { _, args in XCTAssertEqual(args, ["--list-extensions", "--show-versions"]); return .init(success: true, output: "refik.editor-focus@0.1.0") }, extensionRoot: { _ in extensions }, executableAvailable: { _ in true })
         XCTAssertTrue(result.contains("paket doğrulandı")); XCTAssertNotNil(try? Data(contentsOf: receipts))
         XCTAssertEqual(try JSONDecoder().decode([String: String].self, from: Data(contentsOf: receipts))["/Applications/Other.app"], "foreign-receipt")
         let validReceipts = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: receipts))
@@ -285,7 +285,7 @@ final class FirstLaunchSetupTests: XCTestCase {
                 queries += 1
                 XCTAssertEqual(queries, 1, "No immediately-postinstall vendor spawn")
                 return .init(success: true, output: queries > 1 && scenario != "absent" ? "refik.editor-focus@0.1.0" : "")
-            }, extensionRoot: { _ in extensions })
+            }, extensionRoot: { _ in extensions }, executableAvailable: { _ in true })
             let records = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: receipt))
             XCTAssertEqual(records["foreign"], scenario == "concurrent" ? "newer" : "preserved")
             XCTAssertEqual(records[host.application.path] != nil, scenario == "valid" || scenario == "signal" || scenario == "timeoutCleanup" || scenario == "successCleanup", scenario)
@@ -302,7 +302,7 @@ final class FirstLaunchSetupTests: XCTestCase {
                 _ = EditorFocusInstaller.configure(enabled: true, archive: archive, receiptURL: receipt, installations: [host], verified: { _ in true }, runner: { _, args in
                     XCTFail("Exact ready payload must not spawn CLI")
                     return .init(success: true, output: "refik.editor-focus@0.1.0")
-                }, extensionRoot: { _ in extensions })
+                }, extensionRoot: { _ in extensions }, executableAvailable: { _ in true })
                 XCTAssertEqual(try Data(contentsOf: receipt), before)
             }
         }
