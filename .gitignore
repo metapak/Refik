@@ -1,0 +1,9 @@
+.build/
+dist/
+.DS_Store
+*.xcuserstate
+*.swp
+.env
+__pycache__/
+*.pyc
+*.pyo

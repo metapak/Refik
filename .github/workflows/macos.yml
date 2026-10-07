@@ -1,0 +1,30 @@
+name: macOS build and test
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare editor packaging tool
+        run: |
+          tool_root="$(mktemp -d "$RUNNER_TEMP/refik-vsce.XXXXXX")"
+          npm install --prefix "$tool_root" @vscode/vsce@4.0.0 --no-audit --no-fund --ignore-scripts
+          vsce_cli="$tool_root/node_modules/@vscode/vsce/vsce"
+          test -f "$vsce_cli"
+          test "$(node "$vsce_cli" --version)" = '4.0.0'
+          echo "REFIK_VSCE_CLI=$vsce_cli" >> "$GITHUB_ENV"
+      - name: Swift tests
+        run: REFIK_DATA_DIR="$RUNNER_TEMP/refik-ci-tests" swift test
+      - name: PTY watch regression
+        run: python3 Tests/pty_watch.py "$(swift build --show-bin-path)/refikCLI"
+      - name: Build app
+        run: zsh Scripts/build-app.sh --dmg
+      - name: Verify bundle
+        run: |
+          codesign --verify --deep --strict dist/refik.app
+          hdiutil verify dist/refik.dmg

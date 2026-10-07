@@ -1,0 +1,1 @@
+{"buildOnly": true, "package": "@vscode/vsce", "version": "4.0.0", "registry": "https://registry.npmjs.org", "integrity": "sha512-NImwuLaenMmb5D5Jer9/lzi/F9ZQUBOp8Azhj/BVYcTFgixv8KehFXqEUDjQlD2tAiw2E6dDGyjTuAB//di60A==", "scriptsDisabledDuringInstall": true, "runtimeDependencies": []}

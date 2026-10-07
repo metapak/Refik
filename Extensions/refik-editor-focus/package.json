@@ -1,0 +1,8 @@
+{
+  "name": "editor-focus", "publisher": "refik", "displayName": "Refik Project Focus",
+  "description": "Acknowledges completed Refik tasks when their local project window is focused.",
+  "version": "0.1.0", "engines": { "vscode": "^1.75.0" },
+  "main": "./extension.js", "activationEvents": ["onStartupFinished"],
+  "extensionKind": ["ui"], "capabilities": {"untrustedWorkspaces": {"supported": true}, "virtualWorkspaces": {"supported": false}},
+  "license": "UNLICENSED", "scripts": {"test": "node --test extension.test.js"}
+}
