@@ -405,7 +405,7 @@ final class VSCodeCodexTests: XCTestCase {
             let proof = try XCTUnwrap(CodexEditorOriginProof(metadata: meta, file: file, root: root))
             var directHistorical = RolloutAdapter(); directHistorical.rolloutFile = file; directHistorical.rolloutRoot = root
             var terminal: CodexEvent?
-            for item in historicalBytes.split(separator: 10) { for event in directHistorical.parseEvents(Data(item)) where event.kind == .completed { terminal = event } }
+            for item in historicalBytes.split(separator: UInt8(10)) { for event in directHistorical.parseEvents(Data(item)) where event.kind == .completed { terminal = event } }
             let actualEnd = try XCTUnwrap(terminal)
             for variant in ["seen", "newer", "pending", "foreign-root", "foreign-runtime"] {
                 var altered = working

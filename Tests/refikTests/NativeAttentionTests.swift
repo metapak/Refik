@@ -327,7 +327,7 @@ final class NativeAttentionTests: XCTestCase {
                 let url = try rollout(root), observer = watcher(root)
                 if invalid == "missingStart" || invalid == "differentTurn" {
                     var bytes = try Data(contentsOf: url)
-                    var records = bytes.split(separator: 10).map { Data($0) }
+                    var records = bytes.split(separator: UInt8(10)).map { Data($0) }
                     let starts = records.indices.filter { index in
                         guard let object = try? JSONSerialization.jsonObject(with: records[index]) as? [String: Any],
                               object["type"] as? String == "event_msg", let payload = object["payload"] as? [String: Any] else { return false }
@@ -498,7 +498,7 @@ final class NativeAttentionTests: XCTestCase {
         try handle.seek(toOffset: size - count)
         let tail = try XCTUnwrap(handle.read(upToCount: Int(count)))
         XCTAssertEqual(tail.count, Int(count)); XCTAssertEqual(tail.last, 10)
-        for line in tail.split(separator: 10, omittingEmptySubsequences: true).dropFirst() {
+        for line in tail.split(separator: UInt8(10), omittingEmptySubsequences: true).dropFirst() {
             let data = Data(line)
             guard data.count <= 1_000_000, (try? JSONSerialization.jsonObject(with: data)) != nil else {
                 tracker = RolloutCompletionTracker(); tracker.metadata(header); continue
@@ -547,7 +547,7 @@ final class NativeAttentionTests: XCTestCase {
         XCTAssertNil(reducer.sessions["a"]?.codexOriginObservation)
     }
     private func oversizedHistory(_ root: URL, middle: Data = Data(), ending: Data? = nil) throws -> URL {
-        let url = try rollout(root), records = try Data(contentsOf: url).split(separator: 10)
+        let url = try rollout(root), records = try Data(contentsOf: url).split(separator: UInt8(10))
         var data = Data(records[0]); data.append(10)
         // Synthetic content only: the real resumed rollout is never copied.
         data.append(Data("{\"type\":\"response_item\",\"payload\":{\"text\":\"task_started ".utf8))
@@ -602,7 +602,7 @@ final class NativeAttentionTests: XCTestCase {
                 let url = try oversizedHistory(root, middle: middle, ending: ending)
                 var data = try Data(contentsOf: url)
                 if invalid == "missingStart" {
-                    let records = data.split(separator: 10).map(Data.init)
+                    let records = data.split(separator: UInt8(10)).map(Data.init)
                     var removed = 0
                     data = Data()
                     for record in records {
