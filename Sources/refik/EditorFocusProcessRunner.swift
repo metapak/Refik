@@ -40,7 +40,8 @@ enum EditorFocusProcessRunner {
         if output > STDERR_FILENO { _ = posix_spawn_file_actions_addclose(&actions, output) }
         guard setup.allSatisfy({ $0 == 0 }) else { close(output); return .init(success: false, output: "", failure: .preparation) }
         let argv = ([executable.path] + arguments).map { strdup($0) } + [nil]
-        let env = ["HOME=" + NSHomeDirectory(), "PATH=/usr/bin:/bin"].map { strdup($0) } + [nil]
+        let environment: [String] = ["HOME=" + NSHomeDirectory(), "PATH=/usr/bin:/bin"]
+        let env = environment.map { strdup($0) } + [nil]
         defer { argv.compactMap { $0 }.forEach { free($0) }; env.compactMap { $0 }.forEach { free($0) } }
         var pid: pid_t = 0
         let error = argv.withUnsafeBufferPointer { args in env.withUnsafeBufferPointer { variables in
