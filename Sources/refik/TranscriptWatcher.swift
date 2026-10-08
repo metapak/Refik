@@ -589,6 +589,102 @@ struct RolloutCompletionTracker {
     }
 }
 
+// Validate an oversized record without retaining its text. Short strings and
+// JSON structure form a bounded skeleton; Foundation validates its grammar.
+// Every discarded string byte is still checked, including UTF-8 and escapes.
+struct RecoveryJSONRecord {
+    private var skeleton = Data()
+    private var token = Data()
+    private var inString = false
+    private var longString = false
+    private var escape = 0
+    private var hexDigits = 0
+    private var scalar = 0
+    private var highSurrogate = false
+    private var utf8Remaining = 0
+    private var utf8Min: UInt8 = 0x80
+    private var utf8Max: UInt8 = 0xbf
+    private var depth = 0
+    private var previousSyntax: UInt8?
+    private(set) var valid = true
+    mutating func append(_ bytes: Data.SubSequence) {
+        for byte in bytes {
+            guard valid else { return }
+            if inString {
+                if !longString {
+                    token.append(byte)
+                    if token.count > 512 { token.removeAll(keepingCapacity: true); longString = true }
+                }
+                if utf8Remaining > 0 {
+                    guard byte >= utf8Min && byte <= utf8Max else { valid = false; return }
+                    utf8Remaining -= 1; utf8Min = 0x80; utf8Max = 0xbf
+                } else if escape == 2 {
+                    let digit: Int
+                    switch byte {
+                    case 48...57: digit = Int(byte - 48)
+                    case 65...70: digit = Int(byte - 55)
+                    case 97...102: digit = Int(byte - 87)
+                    default: valid = false; return
+                    }
+                    scalar = scalar * 16 + digit; hexDigits += 1
+                    if hexDigits == 4 {
+                        if highSurrogate {
+                            guard (0xdc00...0xdfff).contains(scalar) else { valid = false; return }
+                            highSurrogate = false; escape = 0
+                        } else if (0xd800...0xdbff).contains(scalar) { highSurrogate = true; escape = 3 }
+                        else {
+                            guard !(0xdc00...0xdfff).contains(scalar) else { valid = false; return }
+                            escape = 0
+                        }
+                    }
+                } else if escape == 3 {
+                    guard byte == 92 else { valid = false; return }; escape = 4
+                } else if escape == 1 || escape == 4 {
+                    if byte == 117 { escape = 2; hexDigits = 0; scalar = 0 }
+                    else if escape == 1 && [UInt8(34), 92, 47, 98, 102, 110, 114, 116].contains(byte) { escape = 0 }
+                    else { valid = false; return }
+                } else if byte == 34 {
+                    inString = false; previousSyntax = 34
+                    skeleton.append(longString ? Data("\"\"".utf8) : token)
+                    token.removeAll(keepingCapacity: true)
+                } else if byte == 92 { escape = 1 }
+                else if byte < 32 { valid = false; return }
+                else if byte >= 128 {
+                    switch byte {
+                    case 0xc2...0xdf: utf8Remaining = 1
+                    case 0xe0: utf8Remaining = 2; utf8Min = 0xa0
+                    case 0xe1...0xec, 0xee...0xef: utf8Remaining = 2
+                    case 0xed: utf8Remaining = 2; utf8Max = 0x9f
+                    case 0xf0: utf8Remaining = 3; utf8Min = 0x90
+                    case 0xf1...0xf3: utf8Remaining = 3
+                    case 0xf4: utf8Remaining = 3; utf8Max = 0x8f
+                    default: valid = false; return
+                    }
+                }
+            } else if byte == 34 {
+                inString = true; longString = false; token = Data([byte])
+            } else {
+                // Foundation permits trailing commas; recovery must not.
+                if (byte == 125 || byte == 93) && previousSyntax == 44 { valid = false; return }
+                if ![UInt8(32), 9, 13].contains(byte) { previousSyntax = byte }
+                // Compress whitespace while retaining token boundaries.
+                if [UInt8(32), 9, 13].contains(byte) {
+                    if skeleton.last != 32 { skeleton.append(32) }
+                } else { skeleton.append(byte) }
+                if byte == 123 || byte == 91 { depth += 1 }
+                if byte == 125 || byte == 93 { depth -= 1 }
+                if depth < 0 || depth > 128 { valid = false; return }
+            }
+            if skeleton.count > 1_000_000 { valid = false; return }
+        }
+    }
+    var isCompaction: Bool {
+        guard valid, !inString, depth == 0,
+              let object = try? JSONSerialization.jsonObject(with: skeleton) as? [String: Any] else { return false }
+        return object["type"] as? String == "compacted"
+    }
+}
+
 private struct FileCursor {
     var offset: UInt64 = 0
     var lines = JSONLLineBuffer()
@@ -596,6 +692,7 @@ private struct FileCursor {
     var completionTracker = RolloutCompletionTracker()
     var completionRecoveryRequired = false
     var completionRecoveryOffset: UInt64?
+    var completionRecoveryToken: UUID?
     var recoveredCompletionProof: RolloutCompletionProof?
     var editorOrigin: CodexEditorOriginProof?
     var originTurnID: String?
@@ -628,6 +725,7 @@ final class TranscriptWatcher {
     }
     private let root: URL
     private let queue = DispatchQueue(label: "refik.rollouts", qos: .utility)
+    private let completionRecoveryQueue = DispatchQueue(label: "refik.rollout-proof-recovery", qos: .utility)
     private var stream: FSEventStreamRef?
     private var healthTimer: DispatchSourceTimer?
     private var appendTimer: DispatchSourceTimer?
@@ -726,9 +824,25 @@ final class TranscriptWatcher {
                     // later complete turn. Reconstruct only within a bounded,
                     // stable file snapshot; the ordinary overflow guard remains.
                     if cursor.completionRecoveryOffset != cursor.offset {
-                        cursor.recoveredCompletionProof = boundedCompletionProof(URL(fileURLWithPath: path), cursor: cursor)
-                        cursor.completionRecoveryOffset = cursor.offset
-                        cursors[path] = cursor
+                        if cursor.completionRecoveryToken == nil {
+                            let token = UUID(); cursor.completionRecoveryToken = token
+                            cursors[path] = cursor
+                            let snapshot = cursor
+                            completionRecoveryQueue.async { [weak self] in
+                                guard let self else { return }
+                                let proof = self.boundedCompletionProof(URL(fileURLWithPath: path), size: snapshot.offset, identity: snapshot.identity, modified: snapshot.modified)
+                                self.queue.async {
+                                    guard var current = self.cursors[path], current.completionRecoveryToken == token else { return }
+                                    current.completionRecoveryToken = nil
+                                    if current.offset == snapshot.offset && current.identity == snapshot.identity && current.modified == snapshot.modified {
+                                        current.recoveredCompletionProof = proof
+                                        current.completionRecoveryOffset = snapshot.offset
+                                    }
+                                    self.cursors[path] = current
+                                }
+                            }
+                        }
+                        return nil
                     }
                     return cursor.recoveredCompletionProof
                 }
@@ -736,7 +850,12 @@ final class TranscriptWatcher {
             }
         }
     }
-    private func boundedCompletionProof(_ file: URL, cursor: FileCursor) -> RolloutCompletionProof? {
+    // Internal status also lets deterministic callers await cache preparation;
+    // querying proofs itself never performs the bounded history scan.
+    var completionRecoveryPending: Bool {
+        queue.sync { cursors.values.contains { $0.completionRecoveryToken != nil } }
+    }
+    func boundedCompletionProof(_ file: URL, size: UInt64, identity: UInt64, modified: Date) -> RolloutCompletionProof? {
         guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
         defer { try? handle.close() }
         guard let headerBytes = try? handle.read(upToCount: 256 * 1024),
@@ -748,44 +867,68 @@ final class TranscriptWatcher {
         var tracker = RolloutCompletionTracker(), adapter = RolloutAdapter()
         adapter.rolloutFile = file; adapter.rolloutRoot = root
         tracker.metadata(header); _ = adapter.parseEvents(header)
-        let count = min(cursor.offset, UInt64(8 * 1024 * 1024)), offset = cursor.offset - count
-        guard (try? handle.seek(toOffset: offset)) != nil,
-              let tail = try? handle.read(upToCount: Int(count)), tail.count == Int(count),
-              tail.last == 10 else { return nil }
-        // Discard the first record unless its start is known. Never interpret a
-        // fragment cut from an oversized JSON object as an independent event.
-        var begin = tail.startIndex
-        if offset > 0 {
-            guard let newline = tail.firstIndex(of: 10) else { return nil }
-            begin = tail.index(after: newline)
+        // Bound I/O independently of record size. The usual 8 MiB tail can
+        // begin inside a compaction much larger than that tail. Scan complete
+        // records in chunks, retaining at most 1 MiB of any ordinary record.
+        let count = min(size, UInt64(64 * 1024 * 1024)), offset = size - count
+        guard (try? handle.seek(toOffset: offset)) != nil else { return nil }
+        var position = offset, discardingFragment = offset > 0, unresolvedQuestion = false
+        var line = Data(), oversized = false, validation = RecoveryJSONRecord()
+        func resetContinuity() {
+            unresolvedQuestion = false
+            tracker = RolloutCompletionTracker(); tracker.metadata(header)
+            adapter = RolloutAdapter(); adapter.rolloutFile = file; adapter.rolloutRoot = root
+            _ = adapter.parseEvents(header)
         }
-        for end in tail.indices where end >= begin && tail[end] == 10 {
-            let line = Data(tail[begin..<end]); begin = tail.index(after: end)
-            guard !line.isEmpty else { continue }
-            guard line.count <= 1_000_000,
-                  let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
-                // A subsequent real start may restore continuity, but neither
-                // a terminal alone nor a pending chain can bridge this gap.
-                tracker = RolloutCompletionTracker(); tracker.metadata(header)
-                adapter = RolloutAdapter(); adapter.rolloutFile = file; adapter.rolloutRoot = root
-                _ = adapter.parseEvents(header)
-                continue
+        while position < size {
+            let chunkSize = Int(min(UInt64(256 * 1024), size - position))
+            guard let chunk = try? handle.read(upToCount: chunkSize), chunk.count == chunkSize else { return nil }
+            var begin = chunk.startIndex
+            for end in chunk.indices where chunk[end] == 10 {
+                let piece = chunk[begin..<end]; begin = chunk.index(after: end)
+                if discardingFragment { discardingFragment = false; continue }
+                validation.append(piece)
+                if !oversized && line.count + piece.count <= 1_000_000 { line.append(piece) }
+                else { oversized = true; line.removeAll(keepingCapacity: true) }
+                defer { line.removeAll(keepingCapacity: true); oversized = false; validation = RecoveryJSONRecord() }
+                if oversized {
+                    // Only fully validated top-level compaction can bridge a
+                    // start/end pair. Nested lifecycle-like strings are text.
+                    if !validation.isCompaction { resetContinuity() }
+                    continue
+                }
+                guard !line.isEmpty else { continue }
+                guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+                    resetContinuity(); continue
+                }
+                if object["type"] as? String == "session_meta" {
+                    guard let payload = object["payload"] as? NSDictionary, payload.isEqual(headerPayload) else { return nil }
+                    tracker.metadata(line)
+                }
+                if Self.isNativeQuestionCall(line) { unresolvedQuestion = true }
+                let events = adapter.parseEvents(line)
+                tracker.validateLifecycle(line, events: events)
+                for event in events {
+                    if event.kind == .started { unresolvedQuestion = false }
+                    if event.kind == .requestResolved && !adapter.hasPendingBlockingQuestion { unresolvedQuestion = false }
+                    tracker.event(event, offset: position + UInt64(end))
+                }
             }
-            if object["type"] as? String == "session_meta" {
-                guard let payload = object["payload"] as? NSDictionary, payload.isEqual(headerPayload) else { return nil }
-                tracker.metadata(line)
+            if begin < chunk.endIndex && !discardingFragment {
+                let piece = chunk[begin...]; validation.append(piece)
+                if !oversized && line.count + piece.count <= 1_000_000 { line.append(piece) }
+                else { oversized = true; line.removeAll(keepingCapacity: true) }
             }
-            let events = adapter.parseEvents(line)
-            tracker.validateLifecycle(line, events: events)
-            for event in events { tracker.event(event, offset: offset + UInt64(end)) }
+            position += UInt64(chunk.count)
+            if position == size && chunk.last != 10 { return nil }
         }
-        guard !adapter.hasPendingBlockingQuestion,
+        guard !unresolvedQuestion, !adapter.hasPendingBlockingQuestion,
               let proof = tracker.proof,
               let after = try? FileManager.default.attributesOfItem(atPath: file.path),
               after[.type] as? FileAttributeType == .typeRegular,
-              (after[.size] as? NSNumber)?.uint64Value == cursor.offset,
-              after[.modificationDate] as? Date == cursor.modified,
-              (after[.systemFileNumber] as? NSNumber)?.uint64Value == cursor.identity else { return nil }
+              (after[.size] as? NSNumber)?.uint64Value == size,
+              after[.modificationDate] as? Date == modified,
+              (after[.systemFileNumber] as? NSNumber)?.uint64Value == identity else { return nil }
         return proof
     }
     func reconcile(changedPaths: Set<String>? = nil) { queue.async { self.scan(changedPaths: changedPaths) } }
@@ -938,6 +1081,7 @@ final class TranscriptWatcher {
             }
             let actualStart = candidate.size - UInt64(bytes.count)
             if actualStart > 0 {
+                cursor.completionRecoveryRequired = true
                 if let newline = bytes.firstIndex(of: 10) { bytes = Data(bytes[bytes.index(after: newline)...]) }
                 else { bytes.removeAll() }
             }

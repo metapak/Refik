@@ -280,25 +280,32 @@ final class NativeAttentionTests: XCTestCase {
     private func watcher(_ root: URL) -> TranscriptWatcher {
         TranscriptWatcher(root: root, onEvent: { _, _ in }, onBootstrapDone: {}, onHealth: { _ in })
     }
+    private func settledProofs(_ observer: TranscriptWatcher) -> [RolloutCompletionProof] {
+        let initial = observer.completionProofs()
+        let deadline = Date().addingTimeInterval(10)
+        while observer.completionRecoveryPending && Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
+        XCTAssertFalse(observer.completionRecoveryPending, "bounded recovery must finish")
+        return initial.isEmpty ? observer.completionProofs() : initial
+    }
     func testRolloutProofRequiresExactDesktopRootStartAndCompletionAndRejectsReplay() throws {
         try fixture { root in
             let url = try rollout(root), observer = watcher(root)
             observer.scan()
-            let proof = try XCTUnwrap(observer.completionProofs().first)
+            let proof = try XCTUnwrap(settledProofs(observer).first)
             XCTAssertEqual(proof.completion.thread, "a"); XCTAssertEqual(proof.completion.turn, "turn")
             XCTAssertEqual(proof.started, completion().started)
             XCTAssertNotNil(proof.completion.proofGeneration)
             let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
             try handle.seekToEnd(); try handle.write(contentsOf: lifecycle("task_complete", turn: "turn", time: "1970-01-01T00:15:00.000Z"))
-            XCTAssertTrue(observer.completionProofs().isEmpty, "pending append invalidates before parsing")
+            XCTAssertTrue(settledProofs(observer).isEmpty, "pending append invalidates before parsing")
             observer.scan(changedPaths: [url.path])
-            XCTAssertTrue(observer.completionProofs().isEmpty, "terminal replay is not fresh proof")
+            XCTAssertTrue(settledProofs(observer).isEmpty, "terminal replay is not fresh proof")
         }
         for invalid in [("Codex CLI", false), ("codex_work_desktop", true)] {
             try fixture { root in
                 _ = try rollout(root, origin: invalid.0, parent: invalid.1)
                 let observer = watcher(root); observer.scan()
-                XCTAssertTrue(observer.completionProofs().isEmpty)
+                XCTAssertTrue(settledProofs(observer).isEmpty)
             }
         }
     }
@@ -306,7 +313,7 @@ final class NativeAttentionTests: XCTestCase {
         for invalidation in ["new", "unknown", "truncate", "rotate"] {
             try fixture { root in
                 let url = try rollout(root), observer = watcher(root)
-                observer.scan(); XCTAssertEqual(observer.completionProofs().count, 1)
+                observer.scan(); XCTAssertEqual(settledProofs(observer).count, 1)
                 if invalidation == "rotate" {
                     try FileManager.default.moveItem(at: url, to: root.appendingPathComponent("old.txt"))
                     try Data().write(to: url)
@@ -316,8 +323,8 @@ final class NativeAttentionTests: XCTestCase {
                     try h.seekToEnd(); try h.write(contentsOf: lifecycle(invalidation == "new" ? "task_started" : "task_unknown_terminal",
                         turn: invalidation == "new" ? "new" : "turn", time: "1970-01-01T00:15:10.000Z"))
                 }
-                XCTAssertTrue(observer.completionProofs().isEmpty)
-                observer.scan(changedPaths: [url.path]); XCTAssertTrue(observer.completionProofs().isEmpty, invalidation)
+                XCTAssertTrue(settledProofs(observer).isEmpty)
+                observer.scan(changedPaths: [url.path]); XCTAssertTrue(settledProofs(observer).isEmpty, invalidation)
             }
         }
     }
@@ -344,13 +351,13 @@ final class NativeAttentionTests: XCTestCase {
                     }
                     try bytes.write(to: url)
                 } else {
-                    observer.scan(); XCTAssertEqual(observer.completionProofs().count, 1)
+                    observer.scan(); XCTAssertEqual(settledProofs(observer).count, 1)
                     let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
                     try handle.seekToEnd()
                     try handle.write(contentsOf: Data((invalid == "partial" ? "{\"type\":\"task_started\"" : "{\"type\":\"task_started\"broken}\n").utf8))
                 }
                 observer.scan(changedPaths: [url.path])
-                XCTAssertTrue(observer.completionProofs().isEmpty, invalid)
+                XCTAssertTrue(settledProofs(observer).isEmpty, invalid)
             }
         }
     }
@@ -363,7 +370,7 @@ final class NativeAttentionTests: XCTestCase {
             sqlite3_exec(history, "CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('a','old','interrupted',100,110,1)", nil, nil, nil)
             sqlite3_exec(database, "CREATE TABLE threads(id TEXT,source TEXT,archived INTEGER,agent_path TEXT,cwd TEXT); INSERT INTO threads VALUES('a','vscode',0,NULL,'/tmp/project')", nil, nil, nil)
             _ = try rollout(root); let observer = watcher(root); observer.scan()
-            let proofs = observer.completionProofs(), reader = NativeAttentionReader(root: root), session = completion()
+            let proofs = settledProofs(observer), reader = NativeAttentionReader(root: root), session = completion()
             XCTAssertTrue(reader.verifiedCompletions([session]).isEmpty)
             XCTAssertEqual(reader.verifiedCompletions([session], rolloutProofs: proofs), proofs.map(\.completion))
             for update in ["started_at=890", "started_at=950", "started_at=100,turn_id='turn',status='interrupted'"] {
@@ -487,30 +494,10 @@ final class NativeAttentionTests: XCTestCase {
         XCTAssertEqual(url.resolvingSymlinksInPath(), url)
         let before = try FileManager.default.attributesOfItem(atPath: path)
         let size = try XCTUnwrap(before[.size] as? NSNumber).uint64Value
-        let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
-        let headerBytes = try XCTUnwrap(handle.read(upToCount: 256 * 1024))
-        let newline = try XCTUnwrap(headerBytes.firstIndex(of: 10))
-        let header = Data(headerBytes[..<newline])
-        var adapter = RolloutAdapter(), tracker = RolloutCompletionTracker()
-        adapter.rolloutFile = url; adapter.rolloutRoot = root.appendingPathComponent("sessions")
-        _ = adapter.parseEvents(header); tracker.metadata(header)
-        let count = min(size, UInt64(8 * 1024 * 1024))
-        try handle.seek(toOffset: size - count)
-        let tail = try XCTUnwrap(handle.read(upToCount: Int(count)))
-        XCTAssertEqual(tail.count, Int(count)); XCTAssertEqual(tail.last, 10)
-        for line in tail.split(separator: UInt8(10), omittingEmptySubsequences: true).dropFirst() {
-            let data = Data(line)
-            guard data.count <= 1_000_000, (try? JSONSerialization.jsonObject(with: data)) != nil else {
-                tracker = RolloutCompletionTracker(); tracker.metadata(header); continue
-            }
-            let events = adapter.parseEvents(data)
-            tracker.validateLifecycle(data, events: events)
-            for event in events { tracker.event(event, offset: 0) }
-        }
-        let after = try FileManager.default.attributesOfItem(atPath: path)
-        XCTAssertEqual(before[.modificationDate] as? Date, after[.modificationDate] as? Date)
-        XCTAssertEqual(before[.size] as? NSNumber, after[.size] as? NSNumber)
-        let proof = try XCTUnwrap(tracker.proof)
+        let observer = watcher(root.appendingPathComponent("sessions"))
+        let proof = try XCTUnwrap(observer.boundedCompletionProof(url, size: size,
+            identity: try XCTUnwrap(before[.systemFileNumber] as? NSNumber).uint64Value,
+            modified: try XCTUnwrap(before[.modificationDate] as? Date)))
         XCTAssertEqual(proof.completion.turn, session.turnID)
         let reader = NativeAttentionReader(root: root), now = Date()
         let snapshot = reader.snapshot(now: now)
@@ -562,8 +549,8 @@ final class NativeAttentionTests: XCTestCase {
         try fixture { root in
             _ = try oversizedHistory(root)
             let observer = watcher(root); observer.scan()
-            let proof = try XCTUnwrap(observer.completionProofs().first)
-            XCTAssertEqual(observer.completionProofs().first?.completion.proofGeneration, proof.completion.proofGeneration, "stable snapshot keeps the proof epoch")
+            let proof = try XCTUnwrap(settledProofs(observer).first)
+            XCTAssertEqual(settledProofs(observer).first?.completion.proofGeneration, proof.completion.proofGeneration, "stable snapshot keeps the proof epoch")
             var history: OpaquePointer?, database: OpaquePointer?
             sqlite3_open(root.appendingPathComponent("thread_history_1.sqlite").path, &history)
             sqlite3_open(root.appendingPathComponent("state_5.sqlite").path, &database)
@@ -592,6 +579,126 @@ final class NativeAttentionTests: XCTestCase {
                 XCTAssertTrue(reader.verifiedCompletions([session], rolloutProofs: [proof]).isEmpty)
             }
         }
+    }
+    private func compactionHistory(_ root: URL, suffix: Data = Data()) throws -> URL {
+        let url = try rollout(root), header = try XCTUnwrap(Data(contentsOf: url).split(separator: UInt8(10)).first)
+        let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
+        try handle.truncate(atOffset: 0); try handle.write(contentsOf: header); try handle.write(contentsOf: Data([10]))
+        try handle.write(contentsOf: lifecycle("task_started", turn: "turn", time: "1970-01-01T00:14:50.000Z"))
+        let prefix = Data("{\"type\":\"compacted\",\"payload\":{\"text\":\"".utf8), end = Data("\"}}\n".utf8)
+        try handle.write(contentsOf: prefix)
+        var remaining = 23_670_465 - prefix.count - end.count
+        let chunk = Data(repeating: 120, count: 256 * 1024)
+        while remaining > 0 {
+            let count = min(remaining, chunk.count)
+            try handle.write(contentsOf: chunk.prefix(count)); remaining -= count
+        }
+        try handle.write(contentsOf: end)
+        try handle.write(contentsOf: lifecycle("task_complete", turn: "turn", time: "1970-01-01T00:15:00.000Z"))
+        try handle.write(contentsOf: suffix)
+        return url
+    }
+    func testTwentyThreeMegabyteCompactionRecoversExactReadAndUnreadWithoutSeen() throws {
+        try fixture { root in
+            let url = try compactionHistory(root)
+            // Reproduce the previous 8 MiB algorithm: its first fragment is
+            // discarded, leaving a terminal with no matching start.
+            let handle = try FileHandle(forReadingFrom: url)
+            let size = try handle.seekToEnd(); try handle.seek(toOffset: size - 8 * 1024 * 1024)
+            let tail = try XCTUnwrap(handle.read(upToCount: 8 * 1024 * 1024)); try handle.close()
+            let boundary = try XCTUnwrap(tail.firstIndex(of: 10))
+            let oldRecords = tail[tail.index(after: boundary)...].split(separator: UInt8(10))
+            let oldLifecycle = oldRecords.compactMap { record -> String? in
+                guard let object = try? JSONSerialization.jsonObject(with: record) as? [String: Any],
+                      object["type"] as? String == "event_msg" else { return nil }
+                return (object["payload"] as? [String: Any])?["type"] as? String
+            }
+            XCTAssertEqual(oldLifecycle, ["task_complete"])
+            let observer = watcher(root); observer.scan()
+            let proof = try XCTUnwrap(settledProofs(observer).first)
+            XCTAssertEqual(proof.completion.thread, "a"); XCTAssertEqual(proof.completion.turn, "turn")
+            XCTAssertEqual(proof.started, completion().started); XCTAssertEqual(proof.completion.completed, completion().updated)
+            XCTAssertEqual(proof.cwd, "/tmp/project")
+            XCTAssertEqual(settledProofs(observer).first?.completion.proofGeneration, proof.completion.proofGeneration)
+            var database: OpaquePointer?, history: OpaquePointer?
+            sqlite3_open(root.appendingPathComponent("state_5.sqlite").path, &database)
+            sqlite3_open(root.appendingPathComponent("thread_history_1.sqlite").path, &history)
+            defer { sqlite3_close(database); sqlite3_close(history) }
+            sqlite3_exec(database, "CREATE TABLE threads(id TEXT,source TEXT,archived INTEGER,agent_path TEXT,cwd TEXT); INSERT INTO threads VALUES('a','vscode',0,NULL,'/tmp/project')", nil, nil, nil)
+            sqlite3_exec(history, "CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('a','old','interrupted',100,110,1)", nil, nil, nil)
+            let verified = NativeAttentionReader(root: root).verifiedCompletions([completion()], rolloutProofs: [proof])
+            XCTAssertEqual(verified, [proof.completion], "stale SQL requires exact recovered lifecycle")
+            var reducer = StateReducer(sessions: ["a": completion()])
+            for unread in [Set<String>(), ["a"]] {
+                var sampled = snapshot(unread); sampled.observedAt = now
+                XCTAssertTrue(reducer.reconcileProviderAttention(NativeAttentionMirror.observations(sampled, completions: verified, at: now), at: now))
+                let session = try XCTUnwrap(reducer.sessions["a"])
+                XCTAssertEqual(session.requestsResultAttention, unread.contains("a")); XCTAssertFalse(session.seen)
+            }
+        }
+    }
+    func testLargeCompactionRecoveryStillRejectsNewerLifecycleAndUnresolvedNativeQuestion() throws {
+        for invalid in ["newer", "unknown", "pending", "partial"] {
+            try fixture { root in
+                let suffix: Data
+                switch invalid {
+                case "newer": suffix = lifecycle("task_started", turn: "new", time: "1970-01-01T00:15:10.000Z")
+                case "unknown": suffix = lifecycle("turn_unknown", turn: "turn", time: "1970-01-01T00:15:10.000Z")
+                case "pending": suffix = Data("{\"type\":\"response_item\",\"timestamp\":\"1970-01-01T00:15:10.000Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"request_user_input_async\",\"call_id\":\"pending\",\"arguments\":\"{}\"}}\n".utf8)
+                default: suffix = Data("{\"type\":\"event_msg\"".utf8)
+                }
+                _ = try compactionHistory(root, suffix: suffix)
+                let observer = watcher(root); observer.scan()
+                XCTAssertTrue(settledProofs(observer).isEmpty, invalid)
+            }
+        }
+    }
+    func testBackgroundCompactionRecoveryRejectsChangedSnapshotBeforePublishing() throws {
+        for change in ["append", "rewrite", "replace"] {
+            try fixture { root in
+                let url = try compactionHistory(root), observer = watcher(root); observer.scan()
+                XCTAssertTrue(observer.completionProofs().isEmpty, "query schedules work without waiting for history I/O")
+                XCTAssertTrue(observer.completionRecoveryPending)
+                if change == "append" {
+                    let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
+                    try handle.seekToEnd(); try handle.write(contentsOf: lifecycle("task_started", turn: "new", time: "1970-01-01T00:15:10.000Z"))
+                } else if change == "rewrite" {
+                    let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
+                    let count = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as! NSNumber).uint64Value
+                    try handle.seek(toOffset: count - 2); try handle.write(contentsOf: Data([120]))
+                    try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(10)], ofItemAtPath: url.path)
+                } else { try Data("{\"type\":\"session_meta\"}\n".utf8).write(to: url, options: .atomic) }
+                observer.scan()
+                XCTAssertTrue(settledProofs(observer).isEmpty, change)
+            }
+        }
+    }
+    func testOversizedCompactionValidationIsStructuralAndChecksAllDiscardedBytes() {
+        let padding = String(repeating: "x", count: 1_000_001)
+        let cases: [(String, Bool)] = [
+            ("{\"type\":\"compacted\",\"payload\":{\"text\":\"\(padding)\"}}", true),
+            ("{\"type\":\"compacted\",\"payload\":{\"text\":\"\(padding)\\uD83D\\uDE00\"}}", true),
+            ("{\"type\":\"compacted\",\"payload\":{\"text\":\"\(padding)\\q\"}}", false),
+            ("{\"type\":\"compacted\",\"payload\":{\"text\":\"\(padding)\\uD800\"}}", false),
+            ("{\"type\":\"compacted\",\"payload\":{\"text\":\"\(padding)\"},\"n\":1 2}", false),
+            ("{\"type\":\"compacted\",\"payload\":{\"text\":\"\(padding)\"},}", false),
+            ("{\"type\":\"event_msg\",\"payload\":{\"type\":\"compacted\",\"text\":\"\(padding)\"}}", false),
+            ("{\"payload\":{\"type\":\"compacted\",\"text\":\"\(padding)\"}}", false),
+            ("{\"type\":\"compacted\",\"payload\":{\"text\":\"\(padding)\"}", false)
+        ]
+        for (index, pair) in cases.enumerated() {
+            let (text, expected) = pair
+            let data = Data(text.utf8); var validator = RecoveryJSONRecord()
+            for start in stride(from: 0, to: data.count, by: 4093) {
+                validator.append(data[start..<min(start + 4093, data.count)])
+            }
+            XCTAssertEqual(validator.isCompaction, expected, "case \(index)")
+        }
+        var validator = RecoveryJSONRecord()
+        validator.append(Data("{\"type\":\"compacted\",\"text\":\"".utf8))
+        validator.append(Data(repeating: 120, count: 1_000_001))
+        validator.append(Data([0xc0, 0xaf, 34, 125]))
+        XCTAssertFalse(validator.isCompaction, "invalid UTF-8 after discarded text is rejected")
     }
     func testOversizedHistoryRecoveryRejectsCurrentGapsMissingStartAndWrongProvenance() throws {
         let oversized = Data(repeating: 120, count: 1_000_001) + Data("\n".utf8)
@@ -626,7 +733,7 @@ final class NativeAttentionTests: XCTestCase {
                 }
                 try data.write(to: url)
                 let observer = watcher(root); observer.scan()
-                XCTAssertTrue(observer.completionProofs().isEmpty, invalid)
+                XCTAssertTrue(settledProofs(observer).isEmpty, invalid)
             }
         }
     }
@@ -634,7 +741,7 @@ final class NativeAttentionTests: XCTestCase {
         for change in ["append", "rewrite", "replace"] {
             try fixture { root in
                 let url = try oversizedHistory(root), observer = watcher(root); observer.scan()
-                XCTAssertEqual(observer.completionProofs().count, 1)
+                XCTAssertEqual(settledProofs(observer).count, 1)
                 if change == "append" {
                     let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
                     try handle.seekToEnd(); try handle.write(contentsOf: lifecycle("task_started", turn: "new", time: "1970-01-01T00:15:10.000Z"))
@@ -648,8 +755,8 @@ final class NativeAttentionTests: XCTestCase {
                     if change == "replace" { try data.write(to: url, options: .atomic) }
                     else { try data.write(to: url); try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(10)], ofItemAtPath: url.path) }
                 }
-                XCTAssertTrue(observer.completionProofs().isEmpty, change)
-                observer.scan(changedPaths: [url.path]); XCTAssertTrue(observer.completionProofs().isEmpty, change)
+                XCTAssertTrue(settledProofs(observer).isEmpty, change)
+                observer.scan(changedPaths: [url.path]); XCTAssertTrue(settledProofs(observer).isEmpty, change)
             }
         }
     }
@@ -667,13 +774,13 @@ final class NativeAttentionTests: XCTestCase {
                 try handle.write(contentsOf: Data([10]))
                 if !startInTail { try handle.write(contentsOf: lifecycle("task_started", turn: "turn", time: "1970-01-01T00:14:50.000Z")) }
                 try handle.write(contentsOf: Data("{\"text\":\"task_started ".utf8))
-                try handle.write(contentsOf: Data(repeating: 120, count: (startInTail ? 7 : 9) * 1024 * 1024))
+                try handle.write(contentsOf: Data(repeating: 120, count: (startInTail ? 7 : 65) * 1024 * 1024))
                 try handle.write(contentsOf: Data("\"}\n".utf8))
                 if startInTail { try handle.write(contentsOf: lifecycle("task_started", turn: "turn", time: "1970-01-01T00:14:50.000Z")) }
                 try handle.write(contentsOf: lifecycle("task_complete", turn: "turn", time: "1970-01-01T00:15:00.000Z"))
                 try handle.close()
                 let observer = watcher(root); observer.scan()
-                XCTAssertEqual(observer.completionProofs().count, startInTail ? 1 : 0)
+                XCTAssertEqual(settledProofs(observer).count, startInTail ? 1 : 0)
             }
         }
     }

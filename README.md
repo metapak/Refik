@@ -23,9 +23,9 @@ Three looks, the same status signals. Choose one in Settings → Appearance.
 
 ## Install
 
-**Free beta:** 0.1.0 · macOS 13 or later · Apple Silicon (arm64)
+**Free beta:** 0.1.1 · macOS 13 or later · Apple Silicon (arm64)
 
-**[Download Refik 0.1.0](https://github.com/metapak/Refik/releases/download/v0.1.0/Refik-0.1.0-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.0)
+**[Download Refik 0.1.1](https://github.com/metapak/Refik/releases/download/v0.1.1/Refik-0.1.1-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.1)
 
 1. Open the DMG and drag Refik to **Applications**.
 2. Launch Refik and connect the tools found by the first-launch setup.
@@ -44,7 +44,7 @@ This table separates live usage checks from implemented integrations that still 
 | --- | --- | --- |
 | Codex · Visual Studio Code | Working, waiting and ready states; opening the editor | Live checked |
 | Codex CLI · Terminal.app / iTerm2 | Working, waiting and ready states; opening the configured terminal | Live checked |
-| Codex Desktop | Activity tracking and opening the app | Some completion/read transitions remain under investigation; exact-chat navigation is unverified |
+| Codex Desktop | Activity tracking and opening the app | Completion/read recovery live checked on a long compacted conversation; exact-chat navigation is unverified |
 | Antigravity IDE | Working, waiting and ready states; opening the IDE | Live checked |
 | Antigravity CLI · Terminal.app / iTerm2 | Working, waiting and ready states; opening the configured terminal | Live checked |
 | Cursor · Grok | Notification flow | Live checked for notifications; question and opening flows are not fully validated |
