@@ -41,6 +41,24 @@ enum NativeAttentionMirror {
     }
 }
 
+// Use only after the caller validates the local rollout proof. The exact
+// terminal identity, rather than a clock tolerance, authorizes native start
+// alignment for a derived Desktop generation with a whole-second receipt.
+enum DesktopNativeStartAlignment {
+    static func matches(_ session: Session, thread: String, turn: String, root: String,
+                        runtime: RuntimeMetadata, started: Date, completed: Date) -> Bool {
+        session.provider == .codex && session.source == .desktop && session.supportsDesktopNativeAttention &&
+        session.state == .completed && session.fidelity == .derived && !session.seen && session.pending.isEmpty &&
+        session.id == thread && session.turnID == turn && session.updated == completed &&
+        runtime.host == .codexDesktop && runtime.id == "codex-rollout:desktop:" + thread &&
+        session.runtime?.host == runtime.host && session.runtime?.id == runtime.id &&
+        ProjectIdentity.canonical(session.projectPath) != nil &&
+        ProjectIdentity.canonical(session.projectPath) == ProjectIdentity.canonical(root) &&
+        session.started.timeIntervalSince1970 == floor(session.started.timeIntervalSince1970) &&
+        session.started <= completed && started <= completed
+    }
+}
+
 struct NativeCompletion: Equatable {
     let thread: String
     let turn: String
@@ -297,16 +315,9 @@ final class NativeAttentionReader {
     // No conversation columns or provider credentials are selected.
     private static func matchesRegistry(_ proof: RolloutCompletionProof, session: Session) -> Bool {
         if proof.completion.completed == session.updated && proof.started == session.started { return true }
-        // A whole-second hook/recovery start can survive until a precise
-        // rollout completion replaces the runtime. Bind that existing mixed
-        // generation only to the exact root rollout identity and completion.
-        if session.fidelity == .derived, session.runtime?.host == .codexDesktop,
-           session.runtime?.id == "codex-rollout:desktop:" + session.id,
-           let registryRoot = ProjectIdentity.canonical(session.projectPath),
-           let nativeRoot = ProjectIdentity.canonical(proof.cwd), registryRoot == nativeRoot,
-           session.started.timeIntervalSince1970 == floor(session.started.timeIntervalSince1970),
-           floor(proof.started.timeIntervalSince1970) == session.started.timeIntervalSince1970,
-           proof.completion.completed == session.updated { return true }
+        if DesktopNativeStartAlignment.matches(session, thread: proof.completion.thread, turn: proof.completion.turn,
+            root: proof.cwd, runtime: RuntimeMetadata(id: "codex-rollout:desktop:" + proof.completion.thread, host: .codexDesktop),
+            started: proof.started, completed: proof.completion.completed) { return true }
         // Only the known official helper encoding can lose fractions. This is
         // not a time window: both whole-second boundaries must match, under the
         // independently validated exact Desktop rollout/root/turn proof.

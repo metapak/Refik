@@ -635,15 +635,18 @@ struct StateReducer: Codable {
         if event.fidelity == .derived && [.completed, .failed, .interrupted].contains(s.state) &&
             [.started, .reconciledRunning, .activity].contains(event.kind) { return false }
         // A verified local completion also carries the precise start of the
-        // same turn. Repair only the known whole-second start boundary; never
-        // infer that another turn, pending question, or result was seen.
+        // same turn. Exact derived Desktop terminal identity also authorizes
+        // alignment across a helper receipt's second boundary.
         var normalizedNativeStart = false
         if event.kind == .completed, s.turnID == event.turnID, s.pending.isEmpty,
            let proof = event.codexNativeTurnProof, proof.matches(event),
            proof.source == .desktop, proof.runtime.host == .codexDesktop,
            ProjectIdentity.canonical(s.projectPath) == proof.projectPath,
            s.started.timeIntervalSince1970 == floor(s.started.timeIntervalSince1970),
-           floor(proof.started.timeIntervalSince1970) == s.started.timeIntervalSince1970,
+           (floor(proof.started.timeIntervalSince1970) == s.started.timeIntervalSince1970 ||
+            proof.nativeCompleted.map { DesktopNativeStartAlignment.matches(s,
+                thread: proof.sessionID, turn: proof.turnID, root: proof.projectPath,
+                runtime: proof.runtime, started: proof.started, completed: $0) } == true),
            s.started != proof.started {
             s.started = proof.started; normalizedNativeStart = true
         }

@@ -12,7 +12,7 @@ final class CodexCompletionObservationTests: XCTestCase {
         value.codexOriginObservation = CodexOriginObservation(stage: .missingLocator, locatorPresent: false)
         return value
     }
-    private func rollout(host: RuntimeHost = .terminal) throws -> (URL, CodexEvent, CodexEvent) {
+    private func rollout(host: RuntimeHost = .terminal, started: Double = 0.326, completed: Double = 1.098) throws -> (URL, CodexEvent, CodexEvent) {
         let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("refik-completion-observation-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let file = root.appendingPathComponent("rollout-" + sid + ".jsonl")
@@ -21,8 +21,8 @@ final class CodexCompletionObservationTests: XCTestCase {
             try JSONSerialization.data(withJSONObject: ["type": type, "timestamp": formatter.string(from: base.addingTimeInterval(at)), "payload": payload])
         }
         let meta = try line(["id": sid, "cwd": root.path, "source": host == .terminal ? "cli" : "vscode", "originator": host == .terminal ? "codex-tui" : (host == .vscode ? "codex_vscode" : "Codex Desktop"), "cli_version": "0.153.4"], type: "session_meta", at: 0)
-        let start = try line(["type": "task_started", "turn_id": "turn"], at: 0.326)
-        let complete = try line(["type": "task_complete", "turn_id": "turn"], at: 1.098)
+        let start = try line(["type": "task_started", "turn_id": "turn"], at: started)
+        let complete = try line(["type": "task_complete", "turn_id": "turn"], at: completed)
         try (meta + Data([10]) + start + Data([10]) + complete + Data([10])).write(to: file)
         var parser = RolloutAdapter(); parser.rolloutRoot = root; parser.rolloutFile = file
         _ = parser.parse(meta)
@@ -156,6 +156,40 @@ final class CodexCompletionObservationTests: XCTestCase {
         guessed.runtime = start.runtime; guessed.projectPath = root.path
         _ = reducer.apply(guessed); _ = reducer.apply(end)
         XCTAssertEqual(reducer.sessions[sid]?.state, .running, "serialized host alone is not turn proof")
+    }
+    func testExactDesktopCompletionAligns36MillisecondCrossSecondRegistryStart() throws {
+        let (root, start, complete) = try rollout(host: .codexDesktop, started: 0.964, completed: 262.477)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var session = Session(id: sid, turnID: "turn", source: .desktop, title: "QA", state: .completed,
+            started: base.addingTimeInterval(1), updated: complete.at)
+        session.fidelity = .derived; session.projectPath = root.path; session.runtime = complete.runtime
+        var reducer = StateReducer(sessions: [sid: session])
+        XCTAssertTrue(reducer.apply(complete))
+        XCTAssertEqual(reducer.sessions[sid]?.started, start.at)
+        XCTAssertEqual(reducer.sessions[sid]?.updated, session.updated)
+        XCTAssertEqual(reducer.sessions[sid]?.seen, false)
+        let wireReplay = try JSONDecoder().decode(CodexEvent.self, from: JSONEncoder().encode(complete))
+        XCTAssertNil(wireReplay.codexNativeTurnProof)
+        reducer = StateReducer(sessions: [sid: session]); _ = reducer.apply(wireReplay)
+        XCTAssertEqual(reducer.sessions[sid]?.started, session.started, "wire identity alone cannot align the start")
+        for mutation in ["turn", "root", "runtime", "source", "end", "seen", "pending", "changedRollout"] {
+            var candidate = session
+            switch mutation {
+            case "turn": candidate.turnID = "other"
+            case "root": candidate.projectPath = "/foreign"
+            case "runtime": candidate.runtime = RuntimeMetadata(id: "codex-rollout:desktop:foreign", host: .codexDesktop)
+            case "source": candidate.source = .cli
+            case "end": candidate.updated = complete.at.addingTimeInterval(0.001)
+            case "seen": candidate.seen = true
+            case "pending": candidate.pending = ["question"]
+            default:
+                let file = root.appendingPathComponent("rollout-" + sid + ".jsonl")
+                let handle = try FileHandle(forWritingTo: file); try handle.seekToEnd()
+                try handle.write(contentsOf: Data("\n".utf8)); try handle.close()
+            }
+            reducer = StateReducer(sessions: [sid: candidate]); _ = reducer.apply(complete)
+            XCTAssertEqual(reducer.sessions[sid]?.started, candidate.started, mutation)
+        }
     }
     func testVerifiedDesktopCompletionNormalizesOnlySameWholeSecondStart() throws {
         let (root, start, complete) = try rollout(host: .codexDesktop)

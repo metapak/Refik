@@ -455,7 +455,7 @@ final class NativeAttentionTests: XCTestCase {
                 case "provider": other.provider = .claude
                 case "runtime": other.runtime = RuntimeMetadata(id: "codex-rollout:desktop:other", host: .codexDesktop)
                 case "fraction": other.updated = other.updated.addingTimeInterval(0.001)
-                default: other.started = other.started.addingTimeInterval(1)
+                default: other.started = other.started.addingTimeInterval(0.001)
                 }
                 XCTAssertTrue(reader.verifiedCompletions([other], rolloutProofs: [proof]).isEmpty, mutation)
             }
@@ -472,6 +472,63 @@ final class NativeAttentionTests: XCTestCase {
             let observations = NativeAttentionMirror.observations(NativeAttentionSnapshot(context: context(), unread: [], observedAt: now), completions: [bound], at: now)
             XCTAssertFalse(reducer.reconcileProviderAttention(observations, at: now))
             XCTAssertEqual(reducer.sessions["a"]?.pending, session.pending)
+        }
+    }
+    func testCrossSecondRegistryStartBindsExactNativeCompletionAndPreservesGuards() throws {
+        try fixture { root in
+            var history: OpaquePointer?, database: OpaquePointer?
+            sqlite3_open(root.appendingPathComponent("thread_history_1.sqlite").path, &history)
+            sqlite3_open(root.appendingPathComponent("state_5.sqlite").path, &database)
+            defer { sqlite3_close(history); sqlite3_close(database) }
+            sqlite3_exec(history, "CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('a','old','interrupted',100,110,1)", nil, nil, nil)
+            sqlite3_exec(database, "CREATE TABLE threads(id TEXT,source TEXT,archived INTEGER,agent_path TEXT,cwd TEXT); INSERT INTO threads VALUES('a','vscode',0,NULL,'/tmp')", nil, nil, nil)
+            var session = completion(); session.started = Date(timeIntervalSince1970: 891)
+            session.updated = Date(timeIntervalSince1970: 900.477)
+            session.fidelity = .derived; session.projectPath = "/tmp"
+            session.runtime = RuntimeMetadata(id: "codex-rollout:desktop:a", host: .codexDesktop)
+            let proof = RolloutCompletionProof(completion: NativeCompletion(thread: "a", turn: "turn", completed: session.updated, proofGeneration: "fixture"), started: Date(timeIntervalSince1970: 890.964), cwd: "/tmp")
+            let reader = NativeAttentionReader(root: root)
+            let bound = try XCTUnwrap(reader.verifiedCompletions([session], rolloutProofs: [proof]).first)
+            XCTAssertTrue(bound.matches(proof)); XCTAssertEqual(bound.registryStarted, session.started)
+            for unread in [false, true] {
+                var reducer = StateReducer(sessions: [session.id: session])
+                let observations = NativeAttentionMirror.observations(NativeAttentionSnapshot(context: context(), unread: unread ? ["a"] : [], observedAt: now), completions: [bound], at: now)
+                _ = reducer.reconcileProviderAttention(observations, at: now)
+                XCTAssertEqual(reducer.sessions["a"]?.requestsResultAttention, unread)
+                XCTAssertEqual(reducer.sessions["a"]?.seen, false)
+                for guardKind in ["start", "turn", "end", "pending", "seen"] {
+                    var changed = session
+                    switch guardKind {
+                    case "start": changed.started = changed.started.addingTimeInterval(1)
+                    case "turn": changed.turnID = "newer"
+                    case "end": changed.updated = changed.updated.addingTimeInterval(1)
+                    case "pending": changed.pending = ["question"]
+                    default: changed.seen = true
+                    }
+                    reducer = StateReducer(sessions: [session.id: changed])
+                    XCTAssertFalse(reducer.reconcileProviderAttention(observations, at: now), guardKind)
+                }
+            }
+            for mutation in ["turn", "root", "runtime", "host", "source", "provider", "end", "fractionalStart", "pending", "seen"] {
+                var other = session
+                switch mutation {
+                case "turn": other.turnID = "other"
+                case "root": other.projectPath = "/foreign"
+                case "runtime": other.runtime = RuntimeMetadata(id: "codex-rollout:desktop:other", host: .codexDesktop)
+                case "host": other.runtime?.host = .vscode
+                case "source": other.source = .cli
+                case "provider": other.provider = .claude
+                case "end": other.updated = other.updated.addingTimeInterval(0.001)
+                case "fractionalStart": other.started = other.started.addingTimeInterval(0.001)
+                case "pending": other.pending = ["question"]
+                default: other.seen = true
+                }
+                XCTAssertTrue(reader.verifiedCompletions([other], rolloutProofs: [proof]).isEmpty, mutation)
+            }
+            let replaced = RolloutCompletionProof(completion: NativeCompletion(thread: "a", turn: "turn", completed: session.updated, proofGeneration: "changed"), started: proof.started, cwd: proof.cwd)
+            XCTAssertFalse(bound.matches(replaced))
+            sqlite3_exec(history, "INSERT INTO thread_turns VALUES('a','newer','running',901,NULL,2)", nil, nil, nil)
+            XCTAssertTrue(reader.verifiedCompletions([session], rolloutProofs: [proof]).isEmpty)
         }
     }
     func testOptInCurrentDesktopReadOnlyPrecisionDryRun() throws {
@@ -598,6 +655,33 @@ final class NativeAttentionTests: XCTestCase {
         try handle.write(contentsOf: suffix)
         return url
     }
+    // Opt-in, identical synthetic workload for before/after CPU and latency measurements.
+    func testOptInCompletionRecoveryPerformance() throws {
+        guard ProcessInfo.processInfo.environment["REFIK_RECOVERY_BENCHMARK"] == "1" else { throw XCTSkip("opt-in benchmark") }
+        try fixture { root in
+            let url = try compactionHistory(root)
+            let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd()
+            let normal = Data((String(repeating: "{\"type\":\"event_msg\",\"timestamp\":\"1970-01-01T00:14:55.000Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":1234}}}\n", count: 20_000)).utf8)
+            try handle.write(contentsOf: normal); try handle.close()
+            let observer = watcher(root)
+            func timed(_ phase: String) throws {
+                let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+                let size = try XCTUnwrap(attrs[.size] as? NSNumber).uint64Value
+                let inode = try XCTUnwrap(attrs[.systemFileNumber] as? NSNumber).uint64Value
+                let modified = try XCTUnwrap(attrs[.modificationDate] as? Date)
+                var before = rusage(), after = rusage(); getrusage(RUSAGE_SELF, &before)
+                let start = Date()
+                for _ in 0..<3 { XCTAssertNotNil(observer.boundedCompletionProof(url, size: size, identity: inode, modified: modified)) }
+                getrusage(RUSAGE_SELF, &after)
+                func cpu(_ value: rusage) -> Double { Double(value.ru_utime.tv_sec + value.ru_stime.tv_sec) + Double(value.ru_utime.tv_usec + value.ru_stime.tv_usec) / 1_000_000 }
+                print("RECOVERY_BENCHMARK phase=\(phase) bytes=\(size) runs=3 wall=\(Date().timeIntervalSince(start)) cpu=\(cpu(after) - cpu(before))")
+            }
+            try timed("initial")
+            let append = try FileHandle(forWritingTo: url); try append.seekToEnd()
+            try append.write(contentsOf: Data("{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn\"}}\n".utf8)); try append.close()
+            try timed("small_append")
+        }
+    }
     func testTwentyThreeMegabyteCompactionRecoversExactReadAndUnreadWithoutSeen() throws {
         try fixture { root in
             let url = try compactionHistory(root)
@@ -699,6 +783,39 @@ final class NativeAttentionTests: XCTestCase {
         validator.append(Data(repeating: 120, count: 1_000_001))
         validator.append(Data([0xc0, 0xaf, 34, 125]))
         XCTAssertFalse(validator.isCompaction, "invalid UTF-8 after discarded text is rejected")
+    }
+    func testRecoveryValidatesOversizedPrefixAndSuffixAcrossThreshold() throws {
+        let padding = Data(repeating: 120, count: 1_100_000)
+        let prefix = Data("{\"type\":\"compacted\",\"payload\":{\"text\":\"".utf8)
+        let suffix = Data("\"}}\n".utf8)
+        let records: [(Data, Bool)] = [
+            (prefix + padding + suffix, true),
+            (prefix + Data("\\q".utf8) + padding + suffix, false),
+            (prefix + padding + Data("\\q".utf8) + suffix, false),
+            (prefix + Data([0xc0, 0xaf]) + padding + suffix, false),
+            (prefix + padding + Data([0xc0, 0xaf]) + suffix, false),
+            (prefix + Data("\\uD83D\\uDE00".utf8) + padding + suffix, true),
+            (prefix + Data("\\uD800".utf8) + padding + suffix, false)
+        ]
+        for (index, pair) in records.enumerated() {
+            try fixture { root in
+                let url = try rollout(root)
+                let data = try Data(contentsOf: url)
+                let records = data.split(separator: UInt8(10))
+                var replaced = Data()
+                for (offset, record) in records.enumerated() {
+                    if offset == 2 { replaced.append(pair.0) }
+                    else { replaced.append(record); replaced.append(10) }
+                }
+                try replaced.write(to: url)
+                let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+                let proof = watcher(root).boundedCompletionProof(url,
+                    size: try XCTUnwrap(attrs[.size] as? NSNumber).uint64Value,
+                    identity: try XCTUnwrap(attrs[.systemFileNumber] as? NSNumber).uint64Value,
+                    modified: try XCTUnwrap(attrs[.modificationDate] as? Date))
+                XCTAssertEqual(proof != nil, pair.1, "case \(index)")
+            }
+        }
     }
     func testOversizedHistoryRecoveryRejectsCurrentGapsMissingStartAndWrongProvenance() throws {
         let oversized = Data(repeating: 120, count: 1_000_001) + Data("\n".utf8)

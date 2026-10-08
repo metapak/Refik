@@ -3,6 +3,22 @@ import CoreServices
 import Darwin
 import CryptoKit
 
+// Avoid Foundation's broad attribute/xattr lookup during frequent polling.
+private struct RolloutFileSnapshot {
+    let size: UInt64, identity: UInt64, modified: Date
+    let type: mode_t
+    init?(_ path: String) {
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_size >= 0 else { return nil }
+        identity = UInt64(info.st_ino)
+        type = info.st_mode & S_IFMT
+        size = UInt64(info.st_size)
+        // Match Foundation file dates without rounding nanoseconds at Unix-epoch magnitude.
+        modified = Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec))
+            .addingTimeInterval(Double(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+    }
+}
+
 // Internal, non-wire evidence produced only by a validated local rollout.
 struct CodexCLIQuestionProof {
     let sessionID: String, projectPath: String, turnID: String, runtimeID: String
@@ -77,9 +93,21 @@ struct CodexNativeTurnProof {
     }
 }
 
+// Each adapter is confined to its owning watcher/recovery queue.
+private final class RolloutDates {
+    private let fractional: ISO8601DateFormatter = {
+        let value = ISO8601DateFormatter()
+        value.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return value
+    }()
+    private let whole = ISO8601DateFormatter()
+    func date(_ raw: String) -> Date? { fractional.date(from: raw) ?? whole.date(from: raw) }
+}
+
 // Adapter for observed Codex 0.153.4 / Desktop 26.924 local rollout JSONL.
 // This private format can change; unsupported records are ignored.
 struct RolloutAdapter {
+    private let dates = RolloutDates()
     static func hostForMetadata(source: String?, origin: String?, version: String? = nil) -> RuntimeHost {
         if source == "vscode", origin == "codex-tui", version == "0.160.1" { return .terminal }
         if source == "vscode", origin == "codex_vscode" { return .vscode }
@@ -95,9 +123,8 @@ struct RolloutAdapter {
     private var metadataIdentity: MetadataIdentity?
     private var metadataTime: Date?
     private var metadataInvalidatedActiveTurn = false
-    private func validatedMetadataIdentity(_ line: Data) -> MetadataIdentity? {
+    private func validatedMetadataIdentity(_ object: [String: Any]) -> MetadataIdentity? {
         guard let file = rolloutFile, let root = rolloutRoot,
-              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               object["type"] as? String == "session_meta", let payload = object["payload"] as? [String: Any],
               let id = payload["id"] as? String, UUID(uuidString: id) != nil,
               file.lastPathComponent.hasSuffix("-" + id + ".jsonl"),
@@ -109,19 +136,22 @@ struct RolloutAdapter {
               let source = payload["source"] as? String,
               let origin = payload["originator"] as? String,
               (source == "vscode" && ["codex_vscode", "codex_work_desktop", "Codex Desktop"].contains(origin)) ||
-              (Self.validCLIQuestionMetadata(source: source, origin: origin, version: payload["cli_version"] as? String) && metadataTimestamp(line) != nil) else { return nil }
+              (Self.validCLIQuestionMetadata(source: source, origin: origin, version: payload["cli_version"] as? String) && metadataTimestamp(object) != nil) else { return nil }
         var info = stat()
         guard lstat(file.standardizedFileURL.path, &info) == 0, info.st_uid == getuid(), info.st_mode & S_IFMT == S_IFREG else { return nil }
         return MetadataIdentity(id: id, root: cwd, source: source, origin: origin)
     }
-    private func metadataTimestamp(_ line: Data) -> Date? {
-        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any], let raw = object["timestamp"] as? String else { return nil }
-        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    private func metadataTimestamp(_ object: [String: Any]) -> Date? {
+        guard let raw = object["timestamp"] as? String else { return nil }
+        return dates.date(raw)
     }
     func preservesMetadataRefresh(_ line: Data) -> Bool {
-        guard let existing = metadataIdentity, validatedMetadataIdentity(line) == existing,
-              let at = metadataTimestamp(line), at >= (metadataTime ?? .distantPast),
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return false }
+        return preservesMetadataRefresh(object)
+    }
+    func preservesMetadataRefresh(_ object: [String: Any]) -> Bool {
+        guard let existing = metadataIdentity, validatedMetadataIdentity(object) == existing,
+              let at = metadataTimestamp(object), at >= (metadataTime ?? .distantPast),
               at >= (lastNativeTimestamp ?? .distantPast) else { return false }
         return true
     }
@@ -157,15 +187,17 @@ struct RolloutAdapter {
     }
     var pendingCLIQuestions: [PendingRequestSnapshot] { cliQuestionProof == nil ? [] : Array(blockingQuestions.values) + pendingNativeAsyncSnapshots }
     func orderedNativeQuestionTurn(_ line: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+        return orderedNativeQuestionTurn(object)
+    }
+    func orderedNativeQuestionTurn(_ object: [String: Any]) -> String? {
         guard orderedBlockingHost, let turn = activeTurnID, let started = activeStartedAt,
-              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               object["type"] as? String == "response_item", let payload = object["payload"] as? [String: Any],
               payload["type"] as? String == "function_call", let name = payload["name"] as? String,
               ["request_user_input", "request_user_input_async"].contains(name),
               let call = payload["call_id"] as? String, !call.isEmpty, call.count <= 100,
               !closedBlockingCalls.contains(call), let raw = object["timestamp"] as? String else { return nil }
-        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let at = formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw),
+        guard let at = dates.date(raw),
               at >= started, at >= (lastNativeTimestamp ?? started) else { return nil }
         return turn
     }
@@ -187,16 +219,19 @@ struct RolloutAdapter {
     // Only accepted, structured question items count; tool call text and ordinary
     // assistant prose are not evidence that a user request is pending.
     mutating func parseEvents(_ line: Data) -> [CodexEvent] {
-        if let events = nativeAsyncCallEvents(line) { return events }
-        if let events = blockingQuestionEvents(line) { return events }
-        if let events = questionEvents(line) { return events }
-        return parseLifecycle(line).map { [$0] } ?? []
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return [] }
+        return parseEvents(object)
+    }
+    mutating func parseEvents(_ object: [String: Any]) -> [CodexEvent] {
+        if let events = nativeAsyncCallEvents(object) { return events }
+        if let events = blockingQuestionEvents(object) { return events }
+        if let events = questionEvents(object) { return events }
+        return parseLifecycle(object).map { [$0] } ?? []
     }
 
     // Captured VS Code 0.159.2: call/ACK is observe-only; ACK is not a reply.
-    private mutating func nativeAsyncCallEvents(_ line: Data) -> [CodexEvent]? {
-        guard let turn = orderedNativeQuestionTurn(line),
-              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+    private mutating func nativeAsyncCallEvents(_ object: [String: Any]) -> [CodexEvent]? {
+        guard let turn = orderedNativeQuestionTurn(object),
               let payload = object["payload"] as? [String: Any],
               payload["name"] as? String == "request_user_input_async",
               let call = payload["call_id"] as? String else { return nil }
@@ -205,8 +240,7 @@ struct RolloutAdapter {
               let data = raw.data(using: .utf8), let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let bodies = args["questions"] as? [[String: Any]], (1...4).contains(bodies.count),
               let time = object["timestamp"] as? String else { return [] }
-        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let at = formatter.date(from: time) ?? ISO8601DateFormatter().date(from: time) else { return [] }
+        guard let at = dates.date(time) else { return [] }
         var snapshots: [PendingRequestSnapshot] = []
         for (index, body) in bodies.enumerated() {
             guard let title = body["title"] as? String, !title.isEmpty,
@@ -233,17 +267,14 @@ struct RolloutAdapter {
         }
     }
 
-    private mutating func questionEvents(_ line: Data) -> [CodexEvent]? {
+    private mutating func questionEvents(_ object: [String: Any]) -> [CodexEvent]? {
         guard !isSubagent, !sessionID.isEmpty,
-              let value = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              value["type"] as? String == "event_msg",
-              let payload = value["payload"] as? [String: Any], payload["type"] as? String == "item_completed",
+              object["type"] as? String == "event_msg",
+              let payload = object["payload"] as? [String: Any], payload["type"] as? String == "item_completed",
               let turn = payload["turn_id"] as? String, !turn.isEmpty,
               let item = payload["item"] as? [String: Any], let itemID = item["id"] as? String,
-              let raw = value["timestamp"] as? String else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let time = formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else { return [] }
+              let raw = object["timestamp"] as? String else { return nil }
+        guard let time = dates.date(raw) else { return [] }
         if orderedBlockingHost {
             guard turn == activeTurnID, time >= (activeStartedAt ?? .distantFuture), time >= (lastNativeTimestamp ?? .distantFuture) else { return [] }
         }
@@ -318,14 +349,12 @@ struct RolloutAdapter {
 
     // Native VS Code blocking question calls use the captured 0.160.0 shape.
     // Async accepted ACKs are intentionally handled separately and never resolve these.
-    private mutating func blockingQuestionEvents(_ line: Data) -> [CodexEvent]? {
+    private mutating func blockingQuestionEvents(_ object: [String: Any]) -> [CodexEvent]? {
         guard orderedBlockingHost, let turn = activeTurnID,
-              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               object["type"] as? String == "response_item", let payload = object["payload"] as? [String: Any],
               let call = payload["call_id"] as? String, !call.isEmpty, call.count <= 100,
               let rawTime = object["timestamp"] as? String else { return nil }
-        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let at = formatter.date(from: rawTime) ?? ISO8601DateFormatter().date(from: rawTime) else { return [] }
+        guard let at = dates.date(rawTime) else { return [] }
         guard let started = activeStartedAt, at >= started, at >= (lastNativeTimestamp ?? started) else { return [] }
         let runtime = questionRuntime
         func event(_ kind: EventKind, request: PendingRequestSnapshot) -> CodexEvent {
@@ -410,14 +439,13 @@ struct RolloutAdapter {
             allowsMultipleSelection: (body["multiple"] as? Bool) ?? (body["multiSelect"] as? Bool) ?? false)
     }
 
-    private mutating func parseLifecycle(_ line: Data) -> CodexEvent? {
-        guard let value = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
-        let outer = value["type"] as? String ?? ""
-        guard let payload = value["payload"] as? [String: Any] ?? (outer == "session_meta" ? [:] : nil) else { return nil }
+    private mutating func parseLifecycle(_ object: [String: Any]) -> CodexEvent? {
+        let outer = object["type"] as? String ?? ""
+        guard let payload = object["payload"] as? [String: Any] ?? (outer == "session_meta" ? [:] : nil) else { return nil }
         if outer == "session_meta" {
-            if preservesMetadataRefresh(line) { metadataTime = metadataTimestamp(line); return nil }
+            if preservesMetadataRefresh(object) { metadataTime = metadataTimestamp(object); return nil }
             metadataInvalidatedActiveTurn = activeTurnID != nil
-            metadataIdentity = validatedMetadataIdentity(line); metadataTime = metadataTimestamp(line)
+            metadataIdentity = validatedMetadataIdentity(object); metadataTime = metadataTimestamp(object)
             nativeQuestions.removeAll(); nativeAsyncCalls.removeAll(); questionTurn = nil
             activeTurnID = nil; activeStartedAt = nil; lastNativeTimestamp = nil; retiredTurns.removeAll(); blockingQuestions.removeAll(); closedBlockingCalls.removeAll()
             runtimeHost = .unknown; source = .unknown; chatName = nil
@@ -443,10 +471,8 @@ struct RolloutAdapter {
         if isSubagent { return nil }
         guard outer == "event_msg", let type = payload["type"] as? String,
               let turn = payload["turn_id"] as? String, !sessionID.isEmpty else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let rawTime = value["timestamp"] as? String ?? ""
-        guard let timestamp = formatter.date(from: rawTime) ?? ISO8601DateFormatter().date(from: rawTime) else { return nil }
+        let rawTime = object["timestamp"] as? String ?? ""
+        guard let timestamp = dates.date(rawTime) else { return nil }
         let kind: EventKind
         var detail: String? = nil
         var suffix = type
@@ -552,8 +578,11 @@ struct RolloutCompletionTracker {
     private let generation = UUID().uuidString
     mutating func metadata(_ line: Data) {
         guard line.range(of: Data("\"session_meta\"".utf8)) != nil,
-              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              object["type"] as? String == "session_meta" else { return }
+              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return }
+        metadata(object)
+    }
+    mutating func metadata(_ object: [String: Any]) {
+        guard object["type"] as? String == "session_meta" else { return }
         start = nil; proof = nil; validRoot = false
         guard let p = object["payload"] as? [String: Any],
               let id = p["id"] as? String, !id.isEmpty,
@@ -565,8 +594,11 @@ struct RolloutCompletionTracker {
         session = id; cwd = URL(fileURLWithPath: path).standardizedFileURL.path; validRoot = true
     }
     mutating func validateLifecycle(_ line: Data, events: [CodexEvent]) {
-        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              object["type"] as? String == "event_msg",
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return }
+        validateLifecycle(object, events: events)
+    }
+    mutating func validateLifecycle(_ object: [String: Any], events: [CodexEvent]) {
+        guard object["type"] as? String == "event_msg",
               let payload = object["payload"] as? [String: Any], let type = payload["type"] as? String,
               type.hasPrefix("task_") || type.hasPrefix("turn_") else { return }
         if !["task_started", "task_complete", "turn_aborted"].contains(type) || events.isEmpty {
@@ -813,11 +845,9 @@ final class TranscriptWatcher {
             guard reportedHealth == true else { return [] }
             return Array(cursors.keys).compactMap { path in
                 guard var cursor = cursors[path], cursor.lines.partial.isEmpty,
-                      let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-                      attrs[.type] as? FileAttributeType == .typeRegular,
-                      (attrs[.size] as? NSNumber)?.uint64Value == cursor.offset,
-                      attrs[.modificationDate] as? Date == cursor.modified,
-                      (attrs[.systemFileNumber] as? NSNumber)?.uint64Value == cursor.identity,
+                      let snapshot = RolloutFileSnapshot(path), snapshot.type == S_IFREG,
+                      snapshot.size == cursor.offset, snapshot.modified == cursor.modified,
+                      snapshot.identity == cursor.identity,
                       cursor.identity != 0 else { return nil }
                 if cursor.completionRecoveryRequired || cursor.lines.overflowed {
                     // A historical oversized record cannot permanently poison a
@@ -866,7 +896,7 @@ final class TranscriptWatcher {
               let headerPayload = headerObject["payload"] as? NSDictionary else { return nil }
         var tracker = RolloutCompletionTracker(), adapter = RolloutAdapter()
         adapter.rolloutFile = file; adapter.rolloutRoot = root
-        tracker.metadata(header); _ = adapter.parseEvents(header)
+        tracker.metadata(headerObject); _ = adapter.parseEvents(headerObject)
         // Bound I/O independently of record size. The usual 8 MiB tail can
         // begin inside a compaction much larger than that tail. Scan complete
         // records in chunks, retaining at most 1 MiB of any ordinary record.
@@ -876,9 +906,9 @@ final class TranscriptWatcher {
         var line = Data(), oversized = false, validation = RecoveryJSONRecord()
         func resetContinuity() {
             unresolvedQuestion = false
-            tracker = RolloutCompletionTracker(); tracker.metadata(header)
+            tracker = RolloutCompletionTracker(); tracker.metadata(headerObject)
             adapter = RolloutAdapter(); adapter.rolloutFile = file; adapter.rolloutRoot = root
-            _ = adapter.parseEvents(header)
+            _ = adapter.parseEvents(headerObject)
         }
         while position < size {
             let chunkSize = Int(min(UInt64(256 * 1024), size - position))
@@ -887,9 +917,11 @@ final class TranscriptWatcher {
             for end in chunk.indices where chunk[end] == 10 {
                 let piece = chunk[begin..<end]; begin = chunk.index(after: end)
                 if discardingFragment { discardingFragment = false; continue }
-                validation.append(piece)
                 if !oversized && line.count + piece.count <= 1_000_000 { line.append(piece) }
-                else { oversized = true; line.removeAll(keepingCapacity: true) }
+                else {
+                    if !oversized { validation.append(line); line.removeAll(keepingCapacity: true) }
+                    oversized = true; validation.append(piece)
+                }
                 defer { line.removeAll(keepingCapacity: true); oversized = false; validation = RecoveryJSONRecord() }
                 if oversized {
                     // Only fully validated top-level compaction can bridge a
@@ -903,11 +935,11 @@ final class TranscriptWatcher {
                 }
                 if object["type"] as? String == "session_meta" {
                     guard let payload = object["payload"] as? NSDictionary, payload.isEqual(headerPayload) else { return nil }
-                    tracker.metadata(line)
+                    tracker.metadata(object)
                 }
-                if Self.isNativeQuestionCall(line) { unresolvedQuestion = true }
-                let events = adapter.parseEvents(line)
-                tracker.validateLifecycle(line, events: events)
+                if Self.isNativeQuestionCall(object) { unresolvedQuestion = true }
+                let events = adapter.parseEvents(object)
+                tracker.validateLifecycle(object, events: events)
                 for event in events {
                     if event.kind == .started { unresolvedQuestion = false }
                     if event.kind == .requestResolved && !adapter.hasPendingBlockingQuestion { unresolvedQuestion = false }
@@ -915,20 +947,20 @@ final class TranscriptWatcher {
                 }
             }
             if begin < chunk.endIndex && !discardingFragment {
-                let piece = chunk[begin...]; validation.append(piece)
+                let piece = chunk[begin...]
                 if !oversized && line.count + piece.count <= 1_000_000 { line.append(piece) }
-                else { oversized = true; line.removeAll(keepingCapacity: true) }
+                else {
+                    if !oversized { validation.append(line); line.removeAll(keepingCapacity: true) }
+                    oversized = true; validation.append(piece)
+                }
             }
             position += UInt64(chunk.count)
             if position == size && chunk.last != 10 { return nil }
         }
         guard !unresolvedQuestion, !adapter.hasPendingBlockingQuestion,
               let proof = tracker.proof,
-              let after = try? FileManager.default.attributesOfItem(atPath: file.path),
-              after[.type] as? FileAttributeType == .typeRegular,
-              (after[.size] as? NSNumber)?.uint64Value == size,
-              after[.modificationDate] as? Date == modified,
-              (after[.systemFileNumber] as? NSNumber)?.uint64Value == identity else { return nil }
+              let after = RolloutFileSnapshot(file.path), after.type == S_IFREG,
+              after.size == size, after.modified == modified, after.identity == identity else { return nil }
         return proof
     }
     func reconcile(changedPaths: Set<String>? = nil) { queue.async { self.scan(changedPaths: changedPaths) } }
@@ -966,7 +998,7 @@ final class TranscriptWatcher {
         // File notifications already identify the changed rollout. Enumerating
         // the entire history for every append can queue seconds of metadata work
         // ahead of a small answer, especially while many agents are writing.
-        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .fileResourceIdentifierKey]
+        let keys: [URLResourceKey] = []
         var urls: [URL] = []
         if let changedPaths {
             let base = canonicalPath(root.path)
@@ -992,15 +1024,12 @@ final class TranscriptWatcher {
         let recent = Date().addingTimeInterval(-2 * 24 * 3600)
         var candidates: [Candidate] = []
         for url in Set(urls) {
-            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .fileResourceIdentifierKey]),
-                  let modified = values.contentModificationDate else { continue }
+            guard let snapshot = RolloutFileSnapshot(url.path) else { continue }
+            let modified = snapshot.modified
             // Modification dates only bound historical discovery. A live path can
             // belong to a long-running turn in an older rollout.
             if changedPaths == nil && modified < recent { continue }
-            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-            let identity = (attrs?[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-            let size = UInt64(values.fileSize ?? 0)
-            candidates.append(Candidate(url: url, modified: modified, size: size, identity: identity))
+            candidates.append(Candidate(url: url, modified: modified, size: snapshot.size, identity: snapshot.identity))
         }
         candidates.sort { $0.modified > $1.modified }
         let selected: [Candidate]
@@ -1115,8 +1144,11 @@ final class TranscriptWatcher {
         return payload["type"] as? String == "function_call" && payload["name"] as? String == "request_user_input_async"
     }
     static func isNativeQuestionCall(_ line: Data) -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              object["type"] as? String == "response_item", let payload = object["payload"] as? [String: Any] else { return false }
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return false }
+        return isNativeQuestionCall(object)
+    }
+    private static func isNativeQuestionCall(_ object: [String: Any]) -> Bool {
+        guard object["type"] as? String == "response_item", let payload = object["payload"] as? [String: Any] else { return false }
         return payload["type"] as? String == "function_call" && ["request_user_input_async", "request_user_input"].contains(payload["name"] as? String ?? "")
     }
     private func consume(_ bytes: Data, cursor: inout FileCursor, file: URL) {
