@@ -23,9 +23,9 @@ Kullanılabilen özellikler araca ve bağlantı biçimine göre değişir. Her a
 
 ## Kurulum
 
-**Ücretsiz beta:** 0.1.1 · macOS 13 ve üzeri · Apple Silicon (arm64)
+**Ücretsiz beta:** 0.1.2 · macOS 13 ve üzeri · Apple Silicon (arm64)
 
-**[Refik 0.1.1 indir](https://github.com/metapak/Refik/releases/download/v0.1.1/Refik-0.1.1-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.1)
+**[Refik 0.1.2 indir](https://github.com/metapak/Refik/releases/download/v0.1.2/Refik-0.1.2-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.2)
 
 1. DMG’yi açın, Refik’i **Applications / Uygulamalar** klasörüne taşıyın.
 2. Refik’i başlatıp ilk kurulumda bulunan araçları bağlayın.

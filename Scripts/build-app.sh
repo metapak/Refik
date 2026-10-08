@@ -42,8 +42,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>refik</string>
 <key>CFBundleDisplayName</key><string>refik</string>
 <key>CFBundleIdentifier</key><string>com.refik.app</string>
-<key>CFBundleVersion</key><string>2</string>
-<key>CFBundleShortVersionString</key><string>0.1.1</string>
+<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>0.1.2</string>
 <key>CFBundleExecutable</key><string>refik</string>
 <key>CFBundleIconFile</key><string>refik.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
@@ -52,6 +52,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
+# Remove compiler debug records containing local build paths before signing.
+strip -S "$APP/Contents/MacOS/refik" "$APP/Contents/MacOS/refikHook" "$APP/Contents/MacOS/refikCLI"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 echo "$APP"
