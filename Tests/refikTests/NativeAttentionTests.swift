@@ -280,11 +280,12 @@ final class NativeAttentionTests: XCTestCase {
     private func watcher(_ root: URL) -> TranscriptWatcher {
         TranscriptWatcher(root: root, onEvent: { _, _ in }, onBootstrapDone: {}, onHealth: { _ in })
     }
-    private func settledProofs(_ observer: TranscriptWatcher, sessionIDs: Set<String> = ["a"]) -> [RolloutCompletionProof] {
+    private func settledProofs(_ observer: TranscriptWatcher, sessionIDs: Set<String> = ["a"], timeout: TimeInterval = 10) -> [RolloutCompletionProof] {
         let initial = observer.completionProofs(sessionIDs: sessionIDs)
-        let deadline = Date().addingTimeInterval(10)
+        let started = Date()
+        let deadline = started.addingTimeInterval(timeout)
         while observer.completionRecoveryPending && Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
-        XCTAssertFalse(observer.completionRecoveryPending, "bounded recovery must finish")
+        XCTAssertFalse(observer.completionRecoveryPending, "bounded recovery must finish within \(timeout)s; elapsed=\(Date().timeIntervalSince(started))s, metrics=\(observer.completionRecoveryMetrics)")
         return initial.isEmpty ? observer.completionProofs(sessionIDs: sessionIDs) : initial
     }
     func testRolloutProofRequiresExactDesktopRootStartAndCompletionAndRejectsReplay() throws {
@@ -1041,7 +1042,9 @@ final class NativeAttentionTests: XCTestCase {
                 try handle.write(contentsOf: lifecycle("task_complete", turn: "turn", time: "1970-01-01T00:15:00.000Z"))
                 try handle.close()
                 let observer = watcher(root); observer.scan()
-                XCTAssertEqual(settledProofs(observer).count, startInTail ? 1 : 0)
+                // The 64 MiB tail scan can exceed 10 seconds on shared CI runners.
+                // Keep a bounded wait while preserving both proof assertions.
+                XCTAssertEqual(settledProofs(observer, timeout: 60).count, startInTail ? 1 : 0)
             }
         }
     }
