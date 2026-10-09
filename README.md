@@ -23,9 +23,9 @@ Three looks, the same status signals. Choose one in Settings → Appearance.
 
 ## Install
 
-**Free beta:** 0.1.3 · macOS 13 or later · Apple Silicon (arm64)
+**Free beta:** 0.1.4 · macOS 13 or later · Apple Silicon (arm64)
 
-**[Download Refik 0.1.3](https://github.com/metapak/Refik/releases/download/v0.1.3/Refik-0.1.3-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.3)
+**[Download Refik 0.1.4](https://github.com/metapak/Refik/releases/download/v0.1.4/Refik-0.1.4-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.4)
 
 1. Open the DMG and drag Refik to **Applications**.
 2. Launch Refik and connect the tools found by the first-launch setup.

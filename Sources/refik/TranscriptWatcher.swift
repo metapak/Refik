@@ -575,6 +575,7 @@ struct RolloutCompletionTracker {
     private var start: CodexEvent?
     private var startOffset: UInt64 = 0
     private(set) var proof: RolloutCompletionProof?
+    var rootDesktopSessionID: String? { validRoot ? session : nil }
     private let generation = UUID().uuidString
     mutating func metadata(_ line: Data) {
         guard line.range(of: Data("\"session_meta\"".utf8)) != nil,
@@ -722,6 +723,40 @@ private struct FileCursor {
     var lines = JSONLLineBuffer()
     var adapter = RolloutAdapter()
     var completionTracker = RolloutCompletionTracker()
+    // Identity comes only from the first complete file header. Lifecycle resets
+    // must not make a later metadata record eligible for historical recovery.
+    var completionHeader: NSDictionary?
+    var completionSessionID: String?
+    private var completionHeaderBytes = Data()
+    private var completionHeaderFinished = false
+    mutating func initializeCompletionHeader(_ bytes: Data) {
+        guard !completionHeaderFinished else { return }
+        completionHeaderBytes.append(bytes.prefix(256 * 1024 - completionHeaderBytes.count))
+        guard let end = completionHeaderBytes.firstIndex(of: 10) else {
+            if completionHeaderBytes.count == 256 * 1024 {
+                completionHeaderFinished = true; completionHeaderBytes.removeAll()
+            }
+            return
+        }
+        completionHeaderFinished = true
+        defer { completionHeaderBytes.removeAll() }
+        guard let object = try? JSONSerialization.jsonObject(with: Data(completionHeaderBytes[..<end])) as? [String: Any],
+              object["type"] as? String == "session_meta",
+              let payload = object["payload"] as? NSDictionary else { return }
+        var tracker = RolloutCompletionTracker(); tracker.metadata(object)
+        completionHeader = payload; completionSessionID = tracker.rootDesktopSessionID
+    }
+    mutating func validateCompletionMetadata(_ line: Data) {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+            completionSessionID = nil; return
+        }
+        guard object["type"] as? String == "session_meta" else { return }
+        guard let payload = object["payload"] as? NSDictionary,
+              let header = completionHeader, payload.isEqual(header) else {
+            completionSessionID = nil; recoveredCompletionProof = nil
+            completionRecoveryOffset = nil; completionRecoveryToken = nil; return
+        }
+    }
     var completionRecoveryRequired = false
     var completionRecoveryOffset: UInt64?
     var completionRecoveryToken: UUID?
@@ -774,6 +809,21 @@ final class TranscriptWatcher {
     private let onEditorOriginTurnStarted: (CodexEvent, CodexEditorOriginProof) -> Void
     private let onBootstrapDone: () -> Void
     private let onHealth: (Bool) -> Void
+    private var completionRequestedSessionIDs = Set<String>()
+    #if DEBUG
+    private let recoveryMetricsLock = NSLock()
+    private var recoveryInvocations = 0
+    private var recoveryBytes: UInt64 = 0
+    var completionRecoveryMetrics: (invocations: Int, bytes: UInt64) {
+        recoveryMetricsLock.lock(); defer { recoveryMetricsLock.unlock() }
+        return (recoveryInvocations, recoveryBytes)
+    }
+    #endif
+    private func recordRecoveryRead(_ count: Int) {
+        #if DEBUG
+        recoveryMetricsLock.lock(); recoveryBytes += UInt64(count); recoveryMetricsLock.unlock()
+        #endif
+    }
     private var reportedHealth: Bool?
     private var bootstrapping = true
     private var startedAt = Date()
@@ -840,11 +890,19 @@ final class TranscriptWatcher {
     }
     // Snapshot only fully consumed, unchanged regular files. Pending append,
     // replacement, deletion, or read failure cannot furnish completion proof.
-    func completionProofs() -> [RolloutCompletionProof] {
+    func completionProofs(sessionIDs: Set<String>) -> [RolloutCompletionProof] {
         queue.sync {
-            guard reportedHealth == true else { return [] }
+            completionRequestedSessionIDs = sessionIDs
+            for path in Array(cursors.keys) {
+                guard var cursor = cursors[path],
+                      cursor.completionSessionID.map({ sessionIDs.contains($0) }) != true else { continue }
+                cursor.completionRecoveryToken = nil; cursor.completionRecoveryOffset = nil
+                cursor.recoveredCompletionProof = nil; cursors[path] = cursor
+            }
+            guard reportedHealth == true, !sessionIDs.isEmpty else { return [] }
             return Array(cursors.keys).compactMap { path in
-                guard var cursor = cursors[path], cursor.lines.partial.isEmpty,
+                guard var cursor = cursors[path], let sessionID = cursor.completionSessionID,
+                      sessionIDs.contains(sessionID), cursor.lines.partial.isEmpty,
                       let snapshot = RolloutFileSnapshot(path), snapshot.type == S_IFREG,
                       snapshot.size == cursor.offset, snapshot.modified == cursor.modified,
                       snapshot.identity == cursor.identity,
@@ -862,7 +920,9 @@ final class TranscriptWatcher {
                                 guard let self else { return }
                                 let proof = self.boundedCompletionProof(URL(fileURLWithPath: path), size: snapshot.offset, identity: snapshot.identity, modified: snapshot.modified)
                                 self.queue.async {
-                                    guard var current = self.cursors[path], current.completionRecoveryToken == token else { return }
+                                    guard var current = self.cursors[path], current.completionRecoveryToken == token,
+                                          current.completionSessionID == sessionID,
+                                          self.completionRequestedSessionIDs.contains(sessionID) else { return }
                                     current.completionRecoveryToken = nil
                                     if current.offset == snapshot.offset && current.identity == snapshot.identity && current.modified == snapshot.modified {
                                         current.recoveredCompletionProof = proof
@@ -886,17 +946,23 @@ final class TranscriptWatcher {
         queue.sync { cursors.values.contains { $0.completionRecoveryToken != nil } }
     }
     func boundedCompletionProof(_ file: URL, size: UInt64, identity: UInt64, modified: Date) -> RolloutCompletionProof? {
+        #if DEBUG
+        recoveryMetricsLock.lock(); recoveryInvocations += 1; recoveryMetricsLock.unlock()
+        #endif
         guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
         defer { try? handle.close() }
-        guard let headerBytes = try? handle.read(upToCount: 256 * 1024),
-              let headerEnd = headerBytes.firstIndex(of: 10) else { return nil }
+        guard let headerBytes = try? handle.read(upToCount: 256 * 1024) else { return nil }
+        recordRecoveryRead(headerBytes.count)
+        guard let headerEnd = headerBytes.firstIndex(of: 10) else { return nil }
         let header = Data(headerBytes[..<headerEnd])
         guard let headerObject = try? JSONSerialization.jsonObject(with: header) as? [String: Any],
               headerObject["type"] as? String == "session_meta",
               let headerPayload = headerObject["payload"] as? NSDictionary else { return nil }
         var tracker = RolloutCompletionTracker(), adapter = RolloutAdapter()
         adapter.rolloutFile = file; adapter.rolloutRoot = root
-        tracker.metadata(headerObject); _ = adapter.parseEvents(headerObject)
+        tracker.metadata(headerObject)
+        guard tracker.rootDesktopSessionID != nil else { return nil }
+        _ = adapter.parseEvents(headerObject)
         // Bound I/O independently of record size. The usual 8 MiB tail can
         // begin inside a compaction much larger than that tail. Scan complete
         // records in chunks, retaining at most 1 MiB of any ordinary record.
@@ -913,6 +979,7 @@ final class TranscriptWatcher {
         while position < size {
             let chunkSize = Int(min(UInt64(256 * 1024), size - position))
             guard let chunk = try? handle.read(upToCount: chunkSize), chunk.count == chunkSize else { return nil }
+            recordRecoveryRead(chunk.count)
             var begin = chunk.startIndex
             for end in chunk.indices where chunk[end] == 10 {
                 let piece = chunk[begin..<end]; begin = chunk.index(after: end)
@@ -1078,6 +1145,7 @@ final class TranscriptWatcher {
             // Preserve the entire first-seen history, but yield between bounded
             // reads so a large rollout cannot hold up another file's live reply.
             let chunk = try handle.read(upToCount: min(4 * 1024 * 1024, Int(candidate.size))) ?? Data()
+            cursor.initializeCompletionHeader(chunk)
             cursor.offset += UInt64(chunk.count)
             consume(chunk, cursor: &cursor, file: candidate.url)
             cursors[path] = cursor
@@ -1086,6 +1154,7 @@ final class TranscriptWatcher {
         }
         if cursor.offset == 0 {
             let header = try handle.read(upToCount: 256 * 1024) ?? Data()
+            cursor.initializeCompletionHeader(header)
             if let newline = header.firstIndex(of: 10) {
                 let line = Data(header[..<newline])
                 _ = cursor.adapter.parse(line); cursor.completionTracker.metadata(line)
@@ -1121,6 +1190,7 @@ final class TranscriptWatcher {
         }
         try handle.seek(toOffset: cursor.offset)
         bytes = try handle.read(upToCount: min(Int(candidate.size - cursor.offset), 4 * 1024 * 1024)) ?? Data()
+        cursor.initializeCompletionHeader(bytes)
         cursor.offset += UInt64(bytes.count)
         consume(bytes, cursor: &cursor, file: candidate.url)
         cursors[path] = cursor
@@ -1161,9 +1231,11 @@ final class TranscriptWatcher {
         }
         for line in relevantLines {
             if line.count > 1_000_000 {
+                if line.range(of: sessionMetaMarker) != nil { cursor.completionSessionID = nil }
                 cursor.completionRecoveryRequired = true
                 cursor.completionTracker = RolloutCompletionTracker(); cursor.editorOrigin = nil; continue
             }
+            if line.range(of: sessionMetaMarker) != nil { cursor.validateCompletionMetadata(line) }
             if line.range(of: sessionMetaMarker) != nil, !cursor.adapter.preservesMetadataRefresh(line) {
                 cursor.editorOrigin = CodexEditorOriginProof(metadata: line, file: file, root: root)
                 cursor.originTurnID = nil; cursor.unresolvedNativeQuestion = false

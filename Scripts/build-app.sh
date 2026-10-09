@@ -42,8 +42,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>refik</string>
 <key>CFBundleDisplayName</key><string>refik</string>
 <key>CFBundleIdentifier</key><string>com.refik.app</string>
-<key>CFBundleVersion</key><string>4</string>
-<key>CFBundleShortVersionString</key><string>0.1.3</string>
+<key>CFBundleVersion</key><string>5</string>
+<key>CFBundleShortVersionString</key><string>0.1.4</string>
 <key>CFBundleExecutable</key><string>refik</string>
 <key>CFBundleIconFile</key><string>refik.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>

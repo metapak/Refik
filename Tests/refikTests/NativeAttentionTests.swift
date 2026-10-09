@@ -280,12 +280,12 @@ final class NativeAttentionTests: XCTestCase {
     private func watcher(_ root: URL) -> TranscriptWatcher {
         TranscriptWatcher(root: root, onEvent: { _, _ in }, onBootstrapDone: {}, onHealth: { _ in })
     }
-    private func settledProofs(_ observer: TranscriptWatcher) -> [RolloutCompletionProof] {
-        let initial = observer.completionProofs()
+    private func settledProofs(_ observer: TranscriptWatcher, sessionIDs: Set<String> = ["a"]) -> [RolloutCompletionProof] {
+        let initial = observer.completionProofs(sessionIDs: sessionIDs)
         let deadline = Date().addingTimeInterval(10)
         while observer.completionRecoveryPending && Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
         XCTAssertFalse(observer.completionRecoveryPending, "bounded recovery must finish")
-        return initial.isEmpty ? observer.completionProofs() : initial
+        return initial.isEmpty ? observer.completionProofs(sessionIDs: sessionIDs) : initial
     }
     func testRolloutProofRequiresExactDesktopRootStartAndCompletionAndRejectsReplay() throws {
         try fixture { root in
@@ -655,6 +655,150 @@ final class NativeAttentionTests: XCTestCase {
         try handle.write(contentsOf: suffix)
         return url
     }
+    func testScopedProofWaitsForCompleteFirstHeaderAndNeverUsesLaterStrayHeader() throws {
+        for invalid in [false, true] {
+            try fixture { root in
+                let url = try rollout(root), records = try Data(contentsOf: url)
+                let split = records.count / 5
+                try Data(records.prefix(split)).write(to: url)
+                let observer = watcher(root); observer.scan()
+                XCTAssertTrue(observer.completionProofs(sessionIDs: ["a"]).isEmpty)
+                let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd()
+                if invalid { try handle.write(contentsOf: Data("broken\n".utf8)); try handle.write(contentsOf: records) }
+                else { try handle.write(contentsOf: records.dropFirst(split)) }
+                try handle.close(); observer.scan()
+                XCTAssertEqual(settledProofs(observer).count, invalid ? 0 : 1)
+                XCTAssertEqual(observer.completionRecoveryMetrics.invocations, 0)
+            }
+        }
+    }
+    func testScopedRecoverySchedulesOnlyRequestedDesktopRootAndClearsRemovedCandidate() throws {
+        try fixture { root in
+            let url = try oversizedHistory(root), observer = watcher(root); observer.scan()
+            XCTAssertTrue(observer.completionProofs(sessionIDs: []).isEmpty)
+            XCTAssertTrue(observer.completionProofs(sessionIDs: ["running-other"]).isEmpty)
+            XCTAssertEqual(observer.completionRecoveryMetrics.invocations, 0)
+            XCTAssertFalse(observer.completionRecoveryPending)
+            XCTAssertEqual(settledProofs(observer).count, 1)
+            XCTAssertEqual(observer.completionRecoveryMetrics.invocations, 1)
+            let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd()
+            try handle.write(contentsOf: Data("{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn\"}}\n".utf8)); try handle.close()
+            observer.scan()
+            XCTAssertTrue(observer.completionProofs(sessionIDs: ["a"]).isEmpty)
+            XCTAssertTrue(observer.completionRecoveryPending)
+            XCTAssertTrue(observer.completionProofs(sessionIDs: []).isEmpty)
+            XCTAssertFalse(observer.completionRecoveryPending)
+            XCTAssertEqual(settledProofs(observer).count, 1, "re-added candidate recovers current exact generation")
+        }
+    }
+    func testScopedRecoveryRejectsForeignHeadersBeforeReadingTail() throws {
+        for invalid in ["editor", "cli", "parent", "agent", "unknown", "malformed", "partial", "oversized"] {
+            try fixture { root in
+                let url = try oversizedHistory(root), data = try Data(contentsOf: url)
+                let end = try XCTUnwrap(data.firstIndex(of: 10))
+                var payload: [String: Any] = ["id": "a", "cwd": "/tmp/project", "source": "vscode", "originator": "codex_work_desktop"]
+                if invalid == "editor" { payload["originator"] = "codex_vscode" }
+                if invalid == "cli" { payload["source"] = "cli" }
+                if invalid == "parent" { payload["parent_thread_id"] = "parent" }
+                if invalid == "agent" { payload["agent_path"] = "agent" }
+                if invalid == "unknown" { payload["originator"] = "unknown" }
+                if invalid == "oversized" { payload["title"] = String(repeating: "x", count: 300_000) }
+                var header = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "payload": payload]) + Data([10])
+                if invalid == "malformed" { header = Data("broken\n".utf8) }
+                if invalid == "partial" { header = Data("{\"type\":\"session_meta\"".utf8) }
+                try (header + data[data.index(after: end)...]).write(to: url)
+                let observer = watcher(root); observer.scan()
+                XCTAssertTrue(settledProofs(observer).isEmpty, invalid)
+                XCTAssertEqual(observer.completionRecoveryMetrics.invocations, 0, invalid)
+                if !["partial", "oversized"].contains(invalid) {
+                    let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+                    XCTAssertNil(observer.boundedCompletionProof(url,
+                        size: try XCTUnwrap(attrs[.size] as? NSNumber).uint64Value,
+                        identity: try XCTUnwrap(attrs[.systemFileNumber] as? NSNumber).uint64Value,
+                        modified: try XCTUnwrap(attrs[.modificationDate] as? Date)), invalid)
+                    XCTAssertLessThanOrEqual(observer.completionRecoveryMetrics.bytes, 256 * 1024, invalid)
+                }
+            }
+        }
+    }
+    func testScopedRecoveryMetadataConflictCannotClaimLaterSessionAndReplacementResetsHeader() throws {
+        try fixture { root in
+            let url = try oversizedHistory(root), observer = watcher(root); observer.scan()
+            XCTAssertEqual(settledProofs(observer).count, 1)
+            let originalHeader = try XCTUnwrap(Data(contentsOf: url).split(separator: UInt8(10)).first)
+            let foreignHeader = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "payload": ["id": "foreign", "cwd": "/tmp/project", "source": "vscode", "originator": "codex_work_desktop"]]) + Data([10])
+            let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd()
+            try handle.write(contentsOf: foreignHeader)
+            try handle.write(contentsOf: originalHeader + Data([10]))
+            try handle.write(contentsOf: lifecycle("task_started", turn: "turn", time: "1970-01-01T00:14:50.000Z"))
+            try handle.write(contentsOf: lifecycle("task_complete", turn: "turn", time: "1970-01-01T00:15:00.000Z")); try handle.close()
+            observer.scan()
+            XCTAssertTrue(settledProofs(observer, sessionIDs: ["a", "foreign"]).isEmpty)
+            XCTAssertEqual(observer.completionRecoveryMetrics.invocations, 1)
+            let replacement = root.appendingPathComponent("replacement")
+            try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: true)
+            let fresh = try oversizedHistory(replacement)
+            try FileManager.default.removeItem(at: url); try FileManager.default.moveItem(at: fresh, to: url)
+            observer.scan()
+            XCTAssertEqual(settledProofs(observer).count, 1)
+        }
+    }
+    func testScopedRecoveryPreservesDuplicateRolloutAmbiguity() throws {
+        try fixture { root in
+            let url = try oversizedHistory(root)
+            try FileManager.default.copyItem(at: url, to: root.appendingPathComponent("duplicate.jsonl"))
+            let observer = watcher(root); observer.scan()
+            let proofs = settledProofs(observer)
+            XCTAssertEqual(proofs.count, 2)
+            var database: OpaquePointer?, history: OpaquePointer?
+            sqlite3_open(root.appendingPathComponent("state_5.sqlite").path, &database)
+            sqlite3_open(root.appendingPathComponent("thread_history_1.sqlite").path, &history)
+            defer { sqlite3_close(database); sqlite3_close(history) }
+            sqlite3_exec(database, "CREATE TABLE threads(id TEXT,source TEXT,archived INTEGER,agent_path TEXT,cwd TEXT); INSERT INTO threads VALUES('a','vscode',0,NULL,'/tmp/project')", nil, nil, nil)
+            sqlite3_exec(history, "CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('a','old','interrupted',100,110,1)", nil, nil, nil)
+            XCTAssertTrue(NativeAttentionReader(root: root).verifiedCompletions([completion()], rolloutProofs: proofs).isEmpty)
+        }
+    }
+    func testOptInScopedWatcherRecoveryPerformance() throws {
+        guard ProcessInfo.processInfo.environment["REFIK_SCOPED_RECOVERY_BENCHMARK"] == "1" else { throw XCTSkip("opt-in watcher benchmark") }
+        try fixture { root in
+            var urls: [URL] = []
+            for index in 0..<7 {
+                let url = root.appendingPathComponent("scope-\(index).jsonl")
+                var payload: [String: Any] = ["id": index == 0 ? "eligible" : "excluded-\(index)", "cwd": "/tmp/project", "source": "vscode", "originator": "codex_work_desktop"]
+                if index % 3 == 1 { payload["originator"] = "codex_vscode" }
+                if index % 3 == 2 { payload["parent_thread_id"] = "parent" }
+                let header = try JSONSerialization.data(withJSONObject: ["type": "session_meta", "payload": payload]) + Data([10])
+                try header.write(to: url)
+                let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd()
+                try handle.write(contentsOf: lifecycle("task_started", turn: "turn", time: "1970-01-01T00:14:50.000Z"))
+                try handle.write(contentsOf: Data("{\"type\":\"compacted\",\"text\":\"".utf8))
+                let chunk = Data(repeating: 120, count: 256 * 1024)
+                for _ in 0..<36 { try handle.write(contentsOf: chunk) }
+                try handle.write(contentsOf: Data("\"}\n".utf8))
+                try handle.write(contentsOf: lifecycle("task_complete", turn: "turn", time: "1970-01-01T00:15:00.000Z")); try handle.close()
+                urls.append(url)
+            }
+            let observer = watcher(root); observer.scan()
+            var before = rusage(), after = rusage(); getrusage(RUSAGE_SELF, &before)
+            let start = Date()
+            for round in 0..<3 {
+                if round > 0 {
+                    for url in urls {
+                        let handle = try FileHandle(forWritingTo: url); try handle.seekToEnd()
+                        try handle.write(contentsOf: Data("{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn\"}}\n".utf8)); try handle.close()
+                    }
+                    observer.scan()
+                }
+                XCTAssertTrue(settledProofs(observer, sessionIDs: ["eligible"]).contains { $0.completion.thread == "eligible" })
+                _ = observer.completionProofs(sessionIDs: ["eligible"])
+            }
+            getrusage(RUSAGE_SELF, &after)
+            func cpu(_ value: rusage) -> Double { Double(value.ru_utime.tv_sec + value.ru_stime.tv_sec) + Double(value.ru_utime.tv_usec + value.ru_stime.tv_usec) / 1_000_000 }
+            let metrics = observer.completionRecoveryMetrics
+            print("SCOPED_WATCHER_BENCHMARK files=7 rounds=3 invocations=\(metrics.invocations) bytes=\(metrics.bytes) wall=\(Date().timeIntervalSince(start)) cpu=\(cpu(after) - cpu(before))")
+        }
+    }
     // Opt-in, identical synthetic workload for before/after CPU and latency measurements.
     func testOptInCompletionRecoveryPerformance() throws {
         guard ProcessInfo.processInfo.environment["REFIK_RECOVERY_BENCHMARK"] == "1" else { throw XCTSkip("opt-in benchmark") }
@@ -741,7 +885,7 @@ final class NativeAttentionTests: XCTestCase {
         for change in ["append", "rewrite", "replace"] {
             try fixture { root in
                 let url = try compactionHistory(root), observer = watcher(root); observer.scan()
-                XCTAssertTrue(observer.completionProofs().isEmpty, "query schedules work without waiting for history I/O")
+                XCTAssertTrue(observer.completionProofs(sessionIDs: ["a"]).isEmpty, "query schedules work without waiting for history I/O")
                 XCTAssertTrue(observer.completionRecoveryPending)
                 if change == "append" {
                     let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }

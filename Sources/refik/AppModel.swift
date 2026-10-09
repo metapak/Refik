@@ -736,8 +736,12 @@ struct UsageEntry: Identifiable {
     private func reconcileNativeAttention(at now: Date) {
         guard let reader = nativeAttentionReader else { return }
         let snapshot = reader.snapshot(now: now)
-        let verified = snapshot == nil ? [] : reader.verifiedCompletions(reducer.providerAttentionCandidates, rolloutProofs: watcher?.completionProofs() ?? [])
-        let currentProofs = watcher?.completionProofs() ?? []
+        let candidates = reducer.providerAttentionCandidates.filter {
+            $0.supportsDesktopNativeAttention && $0.state == .completed && !$0.seen
+        }
+        let sessionIDs = Set(candidates.map(\.id))
+        let verified = snapshot == nil ? [] : reader.verifiedCompletions(candidates, rolloutProofs: watcher?.completionProofs(sessionIDs: sessionIDs) ?? [])
+        let currentProofs = watcher?.completionProofs(sessionIDs: sessionIDs) ?? []
         let completions = verified.filter { completion in
             completion.proofGeneration == nil || currentProofs.contains { completion.matches($0) }
         }
