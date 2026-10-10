@@ -123,11 +123,21 @@ struct RolloutAdapter {
     private var metadataIdentity: MetadataIdentity?
     private var metadataTime: Date?
     private var metadataInvalidatedActiveTurn = false
+    private static func questionMetadataFilenameMatches(_ name: String, id: String, payload: [String: Any]) -> Bool {
+        if name.hasSuffix("-" + id + ".jsonl") { return true }
+        // Desktop continuation rollouts retain the root SID followed by their
+        // own UUID. CLI question provenance keeps its exact SID suffix.
+        guard payload["source"] as? String == "vscode",
+              ["codex_work_desktop", "Codex Desktop"].contains(payload["originator"] as? String ?? ""),
+              name.range(of: "^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-" + NSRegularExpression.escapedPattern(for: id) + "_[0-9a-fA-F-]{36}\\.jsonl$", options: .regularExpression) != nil,
+              let range = name.range(of: "-" + id + "_", options: .backwards) else { return false }
+        return UUID(uuidString: String(name[range.upperBound...].dropLast(".jsonl".count))) != nil
+    }
     private func validatedMetadataIdentity(_ object: [String: Any]) -> MetadataIdentity? {
         guard let file = rolloutFile, let root = rolloutRoot,
               object["type"] as? String == "session_meta", let payload = object["payload"] as? [String: Any],
               let id = payload["id"] as? String, UUID(uuidString: id) != nil,
-              file.lastPathComponent.hasSuffix("-" + id + ".jsonl"),
+              Self.questionMetadataFilenameMatches(file.lastPathComponent, id: id, payload: payload),
               file.standardizedFileURL.path == file.resolvingSymlinksInPath().path,
               file.standardizedFileURL.path.hasPrefix(root.standardizedFileURL.resolvingSymlinksInPath().path + "/"),
               payload["subagent"] == nil, payload["parent_thread_id"] == nil,
@@ -205,7 +215,31 @@ struct RolloutAdapter {
     private var nativeAsyncCalls: [String: Set<String>] = [:]
     var pendingNativeAsyncSnapshots: [PendingRequestSnapshot] { nativeAsyncCalls.values.flatMap { $0 }.compactMap { nativeQuestions[$0] } }
     private var closedBlockingCalls: Set<String> = []
-    var hasPendingBlockingQuestion: Bool { !blockingQuestions.isEmpty || !nativeAsyncCalls.isEmpty }
+    // Unclassified calls stay conservative until a matching supported native
+    // record or an ordered terminal boundary establishes their semantics.
+    private var unclassifiedQuestionCalls: [String: String] = [:]
+    private var closedNativeRequests: Set<String> = []
+    private var optionalNativeQuestions: Set<String> = []
+    private var desktopAsyncCalls: [String: (turn: String, at: Date)] = [:]
+    private var validatedDesktopQuestionHost: Bool {
+        runtimeHost == .codexDesktop && metadataIdentity != nil && !isSubagent
+    }
+    private var orderedQuestionHost: Bool { orderedBlockingHost || validatedDesktopQuestionHost }
+    var hasPendingBlockingQuestion: Bool {
+        !blockingQuestions.isEmpty || !nativeAsyncCalls.isEmpty || !unclassifiedQuestionCalls.isEmpty ||
+            nativeQuestions.keys.contains(where: { !optionalNativeQuestions.contains($0) })
+    }
+
+    private mutating func expireNativeQuestions() {
+        closedNativeRequests.formUnion(nativeQuestions.keys)
+        closedBlockingCalls.formUnion(desktopAsyncCalls.keys)
+        for request in nativeQuestions.values {
+            if let data = request.id.data(using: .utf8),
+               let parts = try? JSONSerialization.jsonObject(with: data) as? [Any],
+               parts.count > 1, let call = parts[1] as? String { closedBlockingCalls.insert(call) }
+        }
+        nativeQuestions.removeAll(); optionalNativeQuestions.removeAll(); desktopAsyncCalls.removeAll()
+    }
 
     private var questionRuntime: RuntimeMetadata {
         RuntimeMetadata(id: "codex-rollout:" + source.rawValue + ":" + sessionID,
@@ -223,10 +257,37 @@ struct RolloutAdapter {
         return parseEvents(object)
     }
     mutating func parseEvents(_ object: [String: Any]) -> [CodexEvent] {
-        if let events = nativeAsyncCallEvents(object) { return events }
-        if let events = blockingQuestionEvents(object) { return events }
-        if let events = questionEvents(object) { return events }
-        return parseLifecycle(object).map { [$0] } ?? []
+        if object["type"] as? String == "response_item", let payload = object["payload"] as? [String: Any],
+           payload["type"] as? String == "function_call", let name = payload["name"] as? String,
+           ["request_user_input", "request_user_input_async"].contains(name) {
+            let call = payload["call_id"] as? String ?? "malformed-question"
+            if let raw = object["timestamp"] as? String, let at = dates.date(raw),
+               !call.isEmpty, call.count <= 100, payload["call_id"] is String {
+                // Only a valid timestamp can prove that a call is old. A
+                // malformed timestamp remains a veto for every runtime.
+                if !closedBlockingCalls.contains(call), at >= (activeStartedAt ?? .distantPast),
+                   at >= (lastNativeTimestamp ?? .distantPast),
+                   !(name == "request_user_input" && blockingQuestions[call] != nil),
+                   !(name == "request_user_input_async" && nativeAsyncCalls[call] != nil) {
+                    unclassifiedQuestionCalls[unclassifiedQuestionCalls.count < 256 ? call : "malformed-question"] = name
+                    if validatedDesktopQuestionHost, name == "request_user_input_async",
+                       let turn = activeTurnID, desktopAsyncCalls.count < 256 {
+                        desktopAsyncCalls[call] = (turn, at)
+                    }
+                }
+            } else {
+                unclassifiedQuestionCalls["malformed-question"] = name
+            }
+        }
+        let events: [CodexEvent]
+        if let native = nativeAsyncCallEvents(object) { events = native }
+        else if let blocking = blockingQuestionEvents(object) { events = blocking }
+        else if let question = questionEvents(object) { events = question }
+        else { events = parseLifecycle(object).map { [$0] } ?? [] }
+        // Unsupported/orphan/malformed call vetoes cannot be released by a
+        // valid subset's reply. Supported handlers already remove their own
+        // exact call state; ordered abort/new-turn handles uncertain calls.
+        return events
     }
 
     // Captured VS Code 0.159.2: call/ACK is observe-only; ACK is not a reply.
@@ -253,7 +314,7 @@ struct RolloutAdapter {
             let snapshot = PendingRequestSnapshot(identity: identity, kind: .question, question: QuestionRequestBody(questions: [question]), observedAt: at)
             guard snapshot.isValid else { return [] }; snapshots.append(snapshot)
         }
-        nativeAsyncCalls[call] = Set(snapshots.map(\.id)); lastNativeTimestamp = at
+        nativeAsyncCalls[call] = Set(snapshots.map(\.id)); unclassifiedQuestionCalls.removeValue(forKey: call); lastNativeTimestamp = at
         return snapshots.map { snapshot in
             nativeQuestions[snapshot.id] = snapshot
             var event = CodexEvent(sessionID: sessionID, turnID: turn, requestID: snapshot.id, kind: .userQuestionObserved,
@@ -275,9 +336,10 @@ struct RolloutAdapter {
               let item = payload["item"] as? [String: Any], let itemID = item["id"] as? String,
               let raw = object["timestamp"] as? String else { return nil }
         guard let time = dates.date(raw) else { return [] }
-        if orderedBlockingHost {
+        if orderedQuestionHost {
             guard turn == activeTurnID, time >= (activeStartedAt ?? .distantFuture), time >= (lastNativeTimestamp ?? .distantFuture) else { return [] }
         }
+        if orderedQuestionHost && (closedBlockingCalls.contains(itemID) || closedNativeRequests.contains(itemID)) { return [] }
         let runtime = questionRuntime
         func event(_ request: String, _ kind: EventKind) -> CodexEvent {
             let e = CodexEvent(sessionID: sessionID, turnID: turn, requestID: request, kind: kind,
@@ -287,11 +349,15 @@ struct RolloutAdapter {
                 fidelity: .derived, projectPath: projectPath, runtime: runtime)
             return e
         }
-        if orderedBlockingHost, item["type"] as? String == "AgentMessage",
+        if orderedQuestionHost, item["type"] as? String == "AgentMessage",
            let call = (item["call_id"] as? String) ?? (item["id"] as? String),
            nativeAsyncCalls[call] != nil || closedBlockingCalls.contains(call) { return [] }
         if item["type"] as? String == "AgentMessage", item["delivery"] as? String == "async",
            let questions = item["questions"] as? [[String: Any]], !questions.isEmpty, questions.count <= 64 {
+            if orderedQuestionHost && (nativeQuestions.count + questions.count > 256 || closedNativeRequests.count > 1024 || closedBlockingCalls.count > 256) {
+                unclassifiedQuestionCalls["malformed-question"] = "request_user_input_async"
+                return []
+            }
             if questionTurn == nil { questionTurn = turn }
             var result: [CodexEvent] = []
             for index in questions.indices {
@@ -304,7 +370,6 @@ struct RolloutAdapter {
                     let snapshot = PendingRequestSnapshot(identity: identity, kind: .question,
                         question: QuestionRequestBody(questions: [question]), observedAt: time)
                     if snapshot.isValid {
-                        nativeQuestions[key] = snapshot
                         observed.requestSnapshot = snapshot
                         observed.capabilities = RuntimeCapabilities(provider: .codex, runtimeID: runtime.id, version: "unknown",
                             evidence: [CapabilityEvidence(capability: .observeQuestions, support: .documented,
@@ -314,6 +379,26 @@ struct RolloutAdapter {
                     }
                 }
                 result.append(observed)
+            }
+            let call = item["call_id"] as? String ?? itemID
+            let snapshots = result.compactMap(\.requestSnapshot)
+            let optional = validatedDesktopQuestionHost && !closedBlockingCalls.contains(call) &&
+                desktopAsyncCalls[call]?.turn == turn &&
+                desktopAsyncCalls[call].map({ time >= $0.at }) == true &&
+                result.count == questions.count && snapshots.count == questions.count
+            // Classify the whole accepted group before storing any valid
+            // subset. Orphan/mismatched/malformed items never inherit the
+            // Desktop runtime's optional classification.
+            for snapshot in snapshots {
+                nativeQuestions[snapshot.id] = snapshot
+                if optional { optionalNativeQuestions.insert(snapshot.id) }
+                else { optionalNativeQuestions.remove(snapshot.id) }
+            }
+            if optional {
+                unclassifiedQuestionCalls.removeValue(forKey: call)
+                lastNativeTimestamp = time
+            } else if validatedDesktopQuestionHost {
+                unclassifiedQuestionCalls[unclassifiedQuestionCalls.count < 256 ? call : "malformed-question"] = "unclassified-async-item"
             }
             return result
         }
@@ -333,10 +418,13 @@ struct RolloutAdapter {
                   let index = identity[2] as? Int, index >= 0,
                   let canonical = try? JSONSerialization.data(withJSONObject: identity),
                   let request = String(data: canonical, encoding: .utf8) else { return nil }
-            if orderedBlockingHost, nativeQuestions[request]?.identity.turnID != activeTurnID { return nil }
+            if orderedQuestionHost && closedNativeRequests.contains(request) { return nil }
+            if orderedQuestionHost, nativeQuestions[request]?.identity.turnID != activeTurnID { return nil }
             var resolved = event(request, .requestResolved)
             if let current = nativeQuestions[request], current.identity.turnID == turn {
                 resolved.requestUpdate = RequestLifecycleUpdate(identity: current.identity, lifecycle: .resolved)
+                if orderedQuestionHost { closedNativeRequests.insert(request) }
+                if !orderedBlockingHost { nativeQuestions.removeValue(forKey: request); optionalNativeQuestions.remove(request) }
                 if let call = identity[1] as? String, nativeAsyncCalls[call]?.contains(request) == true {
                     nativeAsyncCalls[call]?.remove(request); nativeQuestions.removeValue(forKey: request)
                     if nativeAsyncCalls[call]?.isEmpty == true { nativeAsyncCalls.removeValue(forKey: call); closedBlockingCalls.insert(call) }
@@ -387,6 +475,7 @@ struct RolloutAdapter {
                 question: QuestionRequestBody(questions: questions), observedAt: at)
             guard request.isValid else { return [] }
             blockingQuestions[call] = request
+            unclassifiedQuestionCalls.removeValue(forKey: call)
             lastNativeTimestamp = at
             var observed = event(.userQuestionObserved, request: request)
             observed.requestSnapshot = request
@@ -447,6 +536,8 @@ struct RolloutAdapter {
             metadataInvalidatedActiveTurn = activeTurnID != nil
             metadataIdentity = validatedMetadataIdentity(object); metadataTime = metadataTimestamp(object)
             nativeQuestions.removeAll(); nativeAsyncCalls.removeAll(); questionTurn = nil
+            unclassifiedQuestionCalls.removeAll(); closedNativeRequests.removeAll()
+            optionalNativeQuestions.removeAll(); desktopAsyncCalls.removeAll()
             activeTurnID = nil; activeStartedAt = nil; lastNativeTimestamp = nil; retiredTurns.removeAll(); blockingQuestions.removeAll(); closedBlockingCalls.removeAll()
             runtimeHost = .unknown; source = .unknown; chatName = nil
             sessionID = payload["id"] as? String ?? sessionID
@@ -478,13 +569,16 @@ struct RolloutAdapter {
         var suffix = type
         switch type {
         case "task_started":
-            if orderedBlockingHost {
+            if orderedQuestionHost {
                 guard !turn.isEmpty, turn.count <= 160, !retiredTurns.contains(turn), turn != activeTurnID,
                       timestamp > (lastNativeTimestamp ?? .distantPast), retiredTurns.count < 256 else { return nil }
                 if let previous = activeTurnID { retiredTurns.insert(previous) }
                 // Retain call tombstones as superseded, never answered.
                 closedBlockingCalls.formUnion(blockingQuestions.keys)
                 closedBlockingCalls.formUnion(nativeAsyncCalls.keys)
+                closedBlockingCalls.formUnion(unclassifiedQuestionCalls.keys)
+                expireNativeQuestions()
+                unclassifiedQuestionCalls.removeAll()
                 nativeAsyncCalls.removeAll()
                 blockingQuestions.removeAll()
             }
@@ -494,19 +588,23 @@ struct RolloutAdapter {
             if questionTurn != turn { nativeQuestions.removeAll(); questionTurn = turn }
         case "task_complete":
             guard !metadataInvalidatedActiveTurn, !hasPendingBlockingQuestion else { return nil }
-            if orderedBlockingHost {
+            if orderedQuestionHost {
                 guard turn == activeTurnID, timestamp >= (lastNativeTimestamp ?? .distantFuture) else { return nil }
                 lastNativeTimestamp = timestamp
             }
+            if validatedDesktopQuestionHost { expireNativeQuestions() }
             kind = .completed
         case "turn_aborted":
-            if orderedBlockingHost {
+            if orderedQuestionHost {
                 guard turn == activeTurnID, timestamp >= (lastNativeTimestamp ?? .distantFuture) else { return nil }
                 lastNativeTimestamp = timestamp
             }
-            if cliQuestionProof != nil {
+            if orderedQuestionHost {
                 closedBlockingCalls.formUnion(blockingQuestions.keys)
                 closedBlockingCalls.formUnion(nativeAsyncCalls.keys)
+                closedBlockingCalls.formUnion(unclassifiedQuestionCalls.keys)
+                expireNativeQuestions()
+                unclassifiedQuestionCalls.removeAll()
                 nativeAsyncCalls.removeAll()
                 nativeQuestions.removeAll()
                 blockingQuestions.removeAll()
@@ -763,7 +861,6 @@ private struct FileCursor {
     var recoveredCompletionProof: RolloutCompletionProof?
     var editorOrigin: CodexEditorOriginProof?
     var originTurnID: String?
-    var unresolvedNativeQuestion = false
     var identity: UInt64 = 0
     var modified = Date.distantPast
 }
@@ -968,10 +1065,9 @@ final class TranscriptWatcher {
         // records in chunks, retaining at most 1 MiB of any ordinary record.
         let count = min(size, UInt64(64 * 1024 * 1024)), offset = size - count
         guard (try? handle.seek(toOffset: offset)) != nil else { return nil }
-        var position = offset, discardingFragment = offset > 0, unresolvedQuestion = false
+        var position = offset, discardingFragment = offset > 0
         var line = Data(), oversized = false, validation = RecoveryJSONRecord()
         func resetContinuity() {
-            unresolvedQuestion = false
             tracker = RolloutCompletionTracker(); tracker.metadata(headerObject)
             adapter = RolloutAdapter(); adapter.rolloutFile = file; adapter.rolloutRoot = root
             _ = adapter.parseEvents(headerObject)
@@ -1004,12 +1100,9 @@ final class TranscriptWatcher {
                     guard let payload = object["payload"] as? NSDictionary, payload.isEqual(headerPayload) else { return nil }
                     tracker.metadata(object)
                 }
-                if Self.isNativeQuestionCall(object) { unresolvedQuestion = true }
                 let events = adapter.parseEvents(object)
                 tracker.validateLifecycle(object, events: events)
                 for event in events {
-                    if event.kind == .started { unresolvedQuestion = false }
-                    if event.kind == .requestResolved && !adapter.hasPendingBlockingQuestion { unresolvedQuestion = false }
                     tracker.event(event, offset: position + UInt64(end))
                 }
             }
@@ -1024,7 +1117,7 @@ final class TranscriptWatcher {
             position += UInt64(chunk.count)
             if position == size && chunk.last != 10 { return nil }
         }
-        guard !unresolvedQuestion, !adapter.hasPendingBlockingQuestion,
+        guard !adapter.hasPendingBlockingQuestion,
               let proof = tracker.proof,
               let after = RolloutFileSnapshot(file.path), after.type == S_IFREG,
               after.size == size, after.modified == modified, after.identity == identity else { return nil }
@@ -1238,10 +1331,9 @@ final class TranscriptWatcher {
             if line.range(of: sessionMetaMarker) != nil { cursor.validateCompletionMetadata(line) }
             if line.range(of: sessionMetaMarker) != nil, !cursor.adapter.preservesMetadataRefresh(line) {
                 cursor.editorOrigin = CodexEditorOriginProof(metadata: line, file: file, root: root)
-                cursor.originTurnID = nil; cursor.unresolvedNativeQuestion = false
+                cursor.originTurnID = nil
             }
             if let proof = cursor.editorOrigin, let turn = cursor.adapter.orderedNativeQuestionTurn(line) {
-                if Self.isAsyncNativeQuestionCall(line) { cursor.unresolvedNativeQuestion = true }
                 onEditorOriginBlocked(proof.sessionID, Self.isAsyncNativeQuestionCall(line) ? .codexAsyncQuestionUnresolved : .codexBlockingQuestionUnresolved, turn)
             }
             cursor.completionTracker.metadata(line)
@@ -1254,25 +1346,20 @@ final class TranscriptWatcher {
             }
             for event in events {
                 cursor.completionTracker.event(event, offset: cursor.offset)
-                if event.at < startedAt, event.kind == .completed, !cursor.unresolvedNativeQuestion,
-                   !cursor.adapter.hasPendingBlockingQuestion, cursor.originTurnID == event.turnID,
+                if event.at < startedAt, event.kind == .completed, !cursor.adapter.hasPendingBlockingQuestion, cursor.originTurnID == event.turnID,
                    let proof = cursor.editorOrigin { onHistoricalEditorCompletion(proof, event) }
                 if event.kind == .userQuestionObserved, let proof = cursor.adapter.cliQuestionProof, proof.matches(event) {
                     onCLIQuestion(event, event.at < startedAt, proof)
                 } else { onEvent(event, event.at < startedAt) }
-                if event.kind == .requestResolved, event.requestUpdate?.identity.generation.hasPrefix("vscode-async:") == true,
-                   cursor.adapter.pendingNativeAsyncSnapshots.isEmpty { cursor.unresolvedNativeQuestion = false }
                 if event.kind == .started {
                     cursor.originTurnID = event.turnID
-                    cursor.unresolvedNativeQuestion = false
                     if let proof = cursor.editorOrigin { onEditorOriginTurnStarted(event, proof) }
                 }
-                if event.at < startedAt, !cursor.unresolvedNativeQuestion,
-                   !cursor.adapter.hasPendingBlockingQuestion, cursor.originTurnID == event.turnID,
+                if event.at < startedAt, !cursor.adapter.hasPendingBlockingQuestion, cursor.originTurnID == event.turnID,
                    [.requestResolved, .completed].contains(event.kind), let proof = cursor.editorOrigin {
                     onEditorOriginReplayed(event, proof)
                 }
-                if event.at >= startedAt, !cursor.unresolvedNativeQuestion, !cursor.adapter.hasPendingBlockingQuestion, cursor.originTurnID == event.turnID,
+                if event.at >= startedAt, !cursor.adapter.hasPendingBlockingQuestion, cursor.originTurnID == event.turnID,
                    let proof = cursor.editorOrigin { onEditorOrigin(event, proof) }
             }
         }

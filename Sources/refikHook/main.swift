@@ -184,7 +184,6 @@ if kind == "failed" { payload["detail"] = "Sağlayıcı hata bildirdi" }
 if kind == "permissionObserved" && correlation == nil {
     payload["detail"] = "İzin istemi görüldü; sağlayıcı çözülme kimliği vermiyor"
 }
-if kind == "permissionObserved" || kind == "userQuestionObserved" { payload["ttl"] = 600 }
 if kind == "userQuestionObserved" {
     payload["detail"] = claudeInputNotification ? "Sağlayıcı kullanıcı girdisi bekliyor; soru ayrıntıları verilmedi" : "Yapılandırılmış kullanıcı sorusu yanıt bekliyor"
 }
@@ -222,7 +221,7 @@ if !normalizationTest && (interactive || kind == "userQuestionObserved" && quest
     let capability = kind == "userQuestionObserved" ? "answerQuestions" : "respondToPermissions"
     if interactive { payload["capabilities"] = ["provider": provider, "runtimeID": runtimeID, "version": runtimeVersion!,
         "evidence": [["capability": capability, "support": "live", "source": "authenticated-hook-invocation"]]] }
-    var snapshot: [String: Any] = ["identity": identity, "kind": kind == "userQuestionObserved" ? "question" : "permission", "lifecycle": "pending", "observedAt": stamp, "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(HookWire.maxLease))]
+    var snapshot: [String: Any] = ["identity": identity, "kind": kind == "userQuestionObserved" ? "question" : "permission", "lifecycle": "pending", "observedAt": stamp, "expiryScope": "responseChannelLease", "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(HookWire.maxLease))]
     if kind == "userQuestionObserved", let toolInput = object["tool_input"] as? [String: Any], let questions = toolInput["questions"] as? [[String: Any]] {
         snapshot["question"] = ["questions": questions.enumerated().map { index, question -> [String: Any] in
             let options = question["options"] as? [[String: Any]] ?? []

@@ -177,6 +177,15 @@ enum EditorFocusInstaller {
             let key = host.application.path
             let receiptBefore = try? Data(contentsOf: receiptURL)
             let existing = payloadProof(host, archive: archive, verified: verified, extensionRoot: extensionRoot)
+            if !enabled {
+                guard let receipt = receipts[key] else { continue }
+                var info = stat()
+                guard receipt == checksum, receiptBefore.flatMap({ try? JSONDecoder().decode([String: String].self, from: $0) }) == receipts,
+                      lstat(receiptURL.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                      info.st_uid == getuid(), info.st_mode & 0o022 == 0 else {
+                    diagnose(host, .receipt, .changed); messages.append("\(host.name): mevcut eklenti ve bağlantı kaydı korunuyor; sahiplik doğrulanamadı"); continue
+                }
+            }
             if enabled, existing?.checksum == checksum, receipts[key] == checksum {
                 diagnose(host, .complete, .none); messages.append("\(host.name): bağlantı zaten kurulu"); continue
             }
@@ -190,14 +199,27 @@ enum EditorFocusInstaller {
                 diagnose(host, .preflight, .commandFinished, result: listed)
                 let own = listed.output.split(whereSeparator: \.isNewline).contains { $0.lowercased().hasPrefix(extensionID + "@") }
                 if enabled && own { diagnose(host, .payload, .foreignPayload); messages.append("\(host.name): aynı kimlikli mevcut eklenti korunuyor; paket doğrulanamadı"); continue }
-                if !enabled && receipts[key] == nil { continue }
-                diagnose(host, .installation, .started)
-                result = runner(host.command, enabled ? ["--install-extension", archive.path] : ["--uninstall-extension", extensionID])
-                diagnose(host, .installation, .commandFinished, result: result)
-                if result.success && !result.cleanupUncertain {
-                    if healthFailures[host.bundleID]?.cleanupUncertain != true { healthFailures.removeValue(forKey: host.bundleID) }
+                if !enabled && own {
+                    let listedOwn = listed.output.split(whereSeparator: \.isNewline).filter { $0.lowercased().hasPrefix(extensionID + "@") }
+                    guard listedOwn.count == 1, listedOwn[0].lowercased() == extensionID + "@" + version,
+                          let existing, existing.checksum == receipts[key],
+                          let current = payloadProof(host, archive: archive, verified: verified, extensionRoot: extensionRoot),
+                          current.checksum == existing.checksum, current.fingerprint == existing.fingerprint,
+                          (try? Data(contentsOf: receiptURL)) == receiptBefore else {
+                        diagnose(host, .payload, .foreignPayload); messages.append("\(host.name): mevcut eklenti ve bağlantı kaydı korunuyor; paket sahipliği doğrulanamadı"); continue
+                    }
                 }
-                else { healthFailures[host.bundleID] = (result.failure, result.cleanupUncertain) }
+                // A valid stale receipt can be cleared when the CLI confirms
+                // absence, without issuing an uninstall command.
+                if enabled || own {
+                    diagnose(host, .installation, .started)
+                    result = runner(host.command, enabled ? ["--install-extension", archive.path] : ["--uninstall-extension", extensionID])
+                    diagnose(host, .installation, .commandFinished, result: result)
+                    if result.success && !result.cleanupUncertain {
+                        if healthFailures[host.bundleID]?.cleanupUncertain != true { healthFailures.removeValue(forKey: host.bundleID) }
+                    }
+                    else { healthFailures[host.bundleID] = (result.failure, result.cleanupUncertain) }
+                }
             }
             let proof = enabled ? payloadProof(host, archive: archive, verified: verified, extensionRoot: extensionRoot) : nil
             if enabled && proof == nil {

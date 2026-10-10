@@ -8,6 +8,9 @@ final class OpenCodeAdapterTests: XCTestCase {
         OpenCodeMockProtocol.server = server
         return try OpenCodeAdapter(configuration: OpenCodeConnectionConfiguration(serverURL: URL(string: endpoint)!, projectDirectory: "/project"), session: URLSession(configuration: config))
     }
+    private func connectionError(_ error: Error) -> OpenCodeConnectionError? {
+        ((error as? OpenCodePreDispatchError)?.underlying ?? error) as? OpenCodeConnectionError
+    }
     func testOnlyExplicitLoopbackEndpointAllowed() throws {
         for address in ["https://example.com", "http://127.0.0.1.evil.test", "http://user:pass@localhost", "http://localhost/path", "file:///tmp"] {
             XCTAssertThrowsError(try OpenCodeAdapter(configuration: .init(serverURL: URL(string: address)!, projectDirectory: "/project")))
@@ -36,7 +39,7 @@ final class OpenCodeAdapterTests: XCTestCase {
         let server = MockOpenCodeServer(); server.supported = false
         let adapter = try adapter(server)
         do { try await adapter.connect(); XCTFail("Expected unsupported") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .unsupportedAPI) }
+        catch { XCTAssertEqual(connectionError(error), .unsupportedAPI) }
         let rejected = await adapter.snapshot()
         XCTAssertFalse(rejected.connected)
         XCTAssertFalse(server.paths.contains("/question"))
@@ -51,7 +54,7 @@ final class OpenCodeAdapterTests: XCTestCase {
         XCTAssertEqual(server.posted?["reply"] as? String, "once")
         XCTAssertEqual(server.postPath, "/permission/perm_1/reply")
         do { _ = try await adapter.submit(.init(identity: request.identity, permissionDecision: .allow), channelID: snapshot.channelID!); XCTFail("Duplicate must be stale") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .staleRequest) }
+        catch { XCTAssertEqual(connectionError(error), .staleRequest) }
         XCTAssertEqual(server.postCount, 1)
     }
     func testQuestionAnswersUseLabelsInQuestionOrder() async throws {
@@ -68,7 +71,7 @@ final class OpenCodeAdapterTests: XCTestCase {
         let adapter = try adapter(server); try await adapter.connect()
         let snapshot = await adapter.snapshot(); let request = snapshot.pending.first { $0.kind == .permission }!
         do { _ = try await adapter.submit(.init(identity: request.identity, permissionDecision: .deny), channelID: snapshot.channelID!); XCTFail("404 must be stale") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .staleRequest) }
+        catch { XCTAssertEqual(connectionError(error), .staleRequest) }
         let removed = await adapter.snapshot()
         XCTAssertFalse(removed.pending.contains { $0.identity == request.identity })
     }
@@ -77,12 +80,12 @@ final class OpenCodeAdapterTests: XCTestCase {
         let adapter = try adapter(server); try await adapter.connect()
         let snapshot = await adapter.snapshot(); let request = snapshot.pending.first { $0.kind == .permission }!
         do { _ = try await adapter.submit(.init(identity: request.identity, permissionDecision: .deny), channelID: snapshot.channelID!); XCTFail("False is unconfirmed") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .unconfirmedResponse) }
+        catch { XCTAssertEqual(connectionError(error), .unconfirmedResponse) }
         let unresolved = await adapter.snapshot()
         XCTAssertTrue(unresolved.pending.contains { $0.identity == request.identity })
         await adapter.stop()
         do { _ = try await adapter.submit(.init(identity: request.identity, permissionDecision: .deny), channelID: snapshot.channelID!); XCTFail("Stopped channel") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .disconnected) }
+        catch { XCTAssertEqual(connectionError(error), .disconnected) }
     }
     func testReconnectionRotatesChannelWithoutInventingNewBackendRequest() async throws {
         let server = MockOpenCodeServer(); let adapter = try adapter(server); try await adapter.connect()
@@ -146,8 +149,123 @@ final class OpenCodeAdapterTests: XCTestCase {
         let current = await adapter.snapshot()
         XCTAssertEqual(current.pending.first { $0.identity == request.identity }?.lifecycle, .deliveryUnknown)
         do { _ = try await adapter.submit(response, channelID: current.channelID!); XCTFail("Stopped uncertain POST cannot retry") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .staleRequest) }
+        catch { XCTAssertEqual(connectionError(error), .staleRequest) }
         XCTAssertEqual(server.postCount, 1)
+    }
+    func testSupersededSSERefreshKeepsChannelAndDoesNotLockUndispatchedSubmission() async throws {
+        let server = MockOpenCodeServer()
+        let olderPaused = expectation(description: "SSE refresh paused")
+        let newerPaused = expectation(description: "Submission preflight paused")
+        let streamContinued = expectation(description: "SSE continued after superseded refresh")
+        let barrier = OpenCodeRefreshBarrier(olderPaused: olderPaused, newerPaused: newerPaused,
+                                             streamContinued: streamContinued)
+        server.refreshBarrier = barrier; server.keepStreamOpen = true
+        let adapter = try adapter(server)
+        let recorder = OpenCodeEventRecorder(recovered: XCTestExpectation(description: "No reconnect required"))
+        await adapter.start { recorder.record($0) }
+        await fulfillment(of: [olderPaused], timeout: 2)
+        let initial = await adapter.snapshot()
+        let request = try XCTUnwrap(initial.pending.first { $0.kind == .question })
+        let channel = try XCTUnwrap(initial.channelID)
+        let response = InteractionResponse(identity: request.identity, answers: [
+            QuestionAnswer(questionID: "0", optionIDs: ["0"]),
+            QuestionAnswer(questionID: "1", optionIDs: ["0"])
+        ])
+        let submission = Task { try await adapter.submit(response, channelID: channel) }
+        await fulfillment(of: [newerPaused], timeout: 2)
+        barrier.release(2)
+        // The buffered SSE event is processed only after the older refresh returns.
+        await fulfillment(of: [streamContinued], timeout: 1)
+        let beforeDispatch = await adapter.snapshot()
+        XCTAssertTrue(beforeDispatch.connected)
+        XCTAssertEqual(beforeDispatch.channelID, channel)
+        XCTAssertEqual(beforeDispatch.pending.first { $0.identity == request.identity }?.lifecycle, .pending)
+        XCTAssertEqual(server.postCount, 0)
+        XCTAssertFalse(recorder.events.contains { $0.requestUpdate?.lifecycle == .deliveryUnknown })
+        XCTAssertFalse(recorder.events.contains { $0.capabilities?.responseChannelID == nil })
+        barrier.release(3)
+        let result = await submission.result
+        switch result {
+        case .success(let receipt): XCTAssertEqual(receipt.lifecycle, .accepted)
+        case .failure(let error): XCTFail("Healthy overlapping refresh must submit: \(error)")
+        }
+        let final = await adapter.snapshot()
+        XCTAssertTrue(final.connected)
+        XCTAssertEqual(final.channelID, channel)
+        XCTAssertEqual(server.postCount, 1)
+        await adapter.stop()
+    }
+    func testStopDuringPreflightDoesNotCreateUnknownDeliveryLock() async throws {
+        let server = MockOpenCodeServer()
+        let paused = expectation(description: "Preflight paused before dispatch")
+        let barrier = OpenCodeRefreshBarrier(olderPaused: paused,
+            newerPaused: XCTestExpectation(description: "Unused newer refresh"),
+            streamContinued: XCTestExpectation(description: "Unused stream refresh"))
+        server.refreshBarrier = barrier
+        let adapter = try adapter(server); try await adapter.connect()
+        let initial = await adapter.snapshot()
+        let request = try XCTUnwrap(initial.pending.first { $0.kind == .permission })
+        let response = InteractionResponse(identity: request.identity, permissionDecision: .allow)
+        let submission = Task { try await adapter.submit(response, channelID: initial.channelID!) }
+        await fulfillment(of: [paused], timeout: 2)
+        await adapter.stop()
+        barrier.release(2)
+        switch await submission.result {
+        case .success: XCTFail("Stopped preflight must fail before dispatch")
+        case .failure(let error): XCTAssertTrue(error is OpenCodePreDispatchError)
+        }
+        server.refreshBarrier = nil
+        try await adapter.connect()
+        let current = await adapter.snapshot()
+        XCTAssertEqual(current.pending.first { $0.identity == request.identity }?.lifecycle, .pending)
+        XCTAssertEqual(server.postCount, 0)
+        _ = try await adapter.submit(response, channelID: current.channelID!)
+        XCTAssertEqual(server.postCount, 1)
+    }
+    func testFailedDispatchedPOSTRetainsUnknownLock() async throws {
+        let server = MockOpenCodeServer(); server.ack = false; server.postStatus = 500
+        let adapter = try adapter(server); try await adapter.connect()
+        let initial = await adapter.snapshot()
+        let request = try XCTUnwrap(initial.pending.first { $0.kind == .permission })
+        let response = InteractionResponse(identity: request.identity, permissionDecision: .allow)
+        do { _ = try await adapter.submit(response, channelID: initial.channelID!); XCTFail("Expected failed POST") }
+        catch { XCTAssertEqual(connectionError(error), .http(500)) }
+        try await adapter.connect()
+        let current = await adapter.snapshot()
+        XCTAssertEqual(current.pending.first { $0.identity == request.identity }?.lifecycle, .deliveryUnknown)
+        do { _ = try await adapter.submit(response, channelID: current.channelID!); XCTFail("Uncertain delivery cannot retry") }
+        catch { XCTAssertEqual(connectionError(error), .staleRequest) }
+        XCTAssertEqual(server.postCount, 1)
+    }
+    func testInFlightPOSTCannotResolveOrLockChangedQuestionGeneration() async throws {
+        for ack in [true, false] {
+            let server = MockOpenCodeServer(); server.ack = ack
+            let sent = expectation(description: "Old generation POST dispatched")
+            let barrier = OpenCodePostBarrier(started: sent)
+            server.postBarrier = barrier
+            let adapter = try adapter(server); try await adapter.connect()
+            let initial = await adapter.snapshot()
+            let request = try XCTUnwrap(initial.pending.first { $0.kind == .question })
+            let response = InteractionResponse(identity: request.identity, answers: [
+                QuestionAnswer(questionID: "0", optionIDs: ["0"]),
+                QuestionAnswer(questionID: "1", optionIDs: ["0"])
+            ])
+            let submission = Task { try await adapter.submit(response, channelID: initial.channelID!) }
+            await fulfillment(of: [sent], timeout: 2)
+            server.questionPending = true; server.questionText = "A new question generation"
+            try await adapter.refresh()
+            let changed = await adapter.snapshot()
+            let replacement = try XCTUnwrap(changed.pending.first { $0.kind == .question })
+            XCTAssertNotEqual(replacement.identity, request.identity)
+            barrier.release()
+            do { _ = try await submission.value; XCTFail("Old generation must not acknowledge replacement") }
+            catch { XCTAssertEqual(connectionError(error), ack ? .staleRequest : .unconfirmedResponse) }
+            let final = await adapter.snapshot()
+            XCTAssertEqual(final.pending.first { $0.kind == .question }?.identity, replacement.identity)
+            XCTAssertEqual(final.pending.first { $0.kind == .question }?.lifecycle, .pending)
+            XCTAssertEqual(server.postCount, 1)
+            await adapter.stop()
+        }
     }
     func testChangedQuestionBodyInvalidatesOldGeneration() async throws {
         let server = MockOpenCodeServer(); let adapter = try adapter(server); try await adapter.connect()
@@ -157,7 +275,7 @@ final class OpenCodeAdapterTests: XCTestCase {
         let changed = await adapter.snapshot(); let replacement = changed.pending.first { $0.kind == .question }!
         XCTAssertNotEqual(request.identity.generation, replacement.identity.generation)
         do { _ = try await adapter.submit(.init(identity: request.identity, answers: [QuestionAnswer(questionID: "0", optionIDs: ["0"]), QuestionAnswer(questionID: "1", optionIDs: ["0"])]), channelID: first.channelID!); XCTFail("Old generation") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .staleRequest) }
+        catch { XCTAssertEqual(connectionError(error), .staleRequest) }
         XCTAssertEqual(server.postCount, 0)
     }
     func testUnknownDeliveryCannotBeRetriedEvenAfterSnapshot() async throws {
@@ -170,7 +288,7 @@ final class OpenCodeAdapterTests: XCTestCase {
         let current = await adapter.snapshot()
         XCTAssertEqual(current.pending.first { $0.identity == request.identity }?.lifecycle, .deliveryUnknown)
         do { _ = try await adapter.submit(response, channelID: current.channelID!); XCTFail("Unknown delivery cannot retry") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .staleRequest) }
+        catch { XCTAssertEqual(connectionError(error), .staleRequest) }
         XCTAssertEqual(server.postCount, 1)
     }
     func testSelectSessionRequiresDeclaredCapabilityAndExactProject() async throws {
@@ -179,11 +297,12 @@ final class OpenCodeAdapterTests: XCTestCase {
         try await adapter.selectSession(sessionID: selected.pending.first!.identity.sessionID)
         XCTAssertEqual(server.posted?["sessionID"] as? String, "ses_1")
         do { try await adapter.selectSession(sessionID: "ses_other"); XCTFail("Other project") }
-        catch { XCTAssertEqual(error as? OpenCodeConnectionError, .unsupportedAPI) }
+        catch { XCTAssertEqual(connectionError(error), .unsupportedAPI) }
     }
 }
 
 private final class MockOpenCodeServer: @unchecked Sendable {
+    private let lock = NSLock()
     var supported = true
     var ack = true
     var postStatus = 200
@@ -192,12 +311,16 @@ private final class MockOpenCodeServer: @unchecked Sendable {
     var includeQuestionTool = true
     var permissionPending = true
     var delayPost = false
+    var keepStreamOpen = false
+    var refreshBarrier: OpenCodeRefreshBarrier?
+    var postBarrier: OpenCodePostBarrier?
     var postStarted: XCTestExpectation?
     var posted: [String: Any]?
     var postPath: String?
     var postCount = 0
     var paths: [String] = []
     func response(_ request: URLRequest) -> (Int, Any) {
+        lock.lock(); defer { lock.unlock() }
         let path = request.url!.path; paths.append(path)
         if request.httpMethod == "POST" {
             postCount += 1; postPath = path
@@ -247,8 +370,10 @@ private final class OpenCodeMockProtocol: URLProtocol, @unchecked Sendable {
         let deliver = { [self] in
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": isStream ? "text/event-stream" : "application/json"])!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
-        client?.urlProtocolDidFinishLoading(self)
+        if !isStream || !Self.server.keepStreamOpen { client?.urlProtocolDidFinishLoading(self) }
         }
+        if Self.server.refreshBarrier?.hold(request, deliver: deliver) == true { return }
+        if request.httpMethod == "POST", let barrier = Self.server.postBarrier { barrier.hold(deliver); return }
         if Self.server.delayPost && request.httpMethod == "POST" {
             let work = DispatchWorkItem(block: deliver); delayedResponse = work
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.5, execute: work)
@@ -276,5 +401,51 @@ private final class OpenCodeEventRecorder: @unchecked Sendable {
         if let channel = event.capabilities?.responseChannelID, channels.insert(channel).inserted, channels.count == 2 {
             recovered.fulfill()
         }
+    }
+}
+
+// Release actual network responses rather than relying on sleep to order actor resumptions.
+private final class OpenCodeRefreshBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private var statusCount = 0
+    private var questionCount = 0
+    private var held: [Int: () -> Void] = [:]
+    private let olderPaused: XCTestExpectation
+    private let newerPaused: XCTestExpectation
+    private let streamContinued: XCTestExpectation
+    init(olderPaused: XCTestExpectation, newerPaused: XCTestExpectation, streamContinued: XCTestExpectation) {
+        self.olderPaused = olderPaused; self.newerPaused = newerPaused; self.streamContinued = streamContinued
+    }
+    func hold(_ request: URLRequest, deliver: @escaping () -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if request.url?.path == "/question" {
+            questionCount += 1
+            if questionCount == 4 { streamContinued.fulfill() }
+        }
+        guard request.url?.path == "/session/status" else { return false }
+        statusCount += 1
+        guard statusCount == 2 || statusCount == 3 else { return false }
+        held[statusCount] = deliver
+        (statusCount == 2 ? olderPaused : newerPaused).fulfill()
+        return true
+    }
+    func release(_ ordinal: Int) {
+        lock.lock(); let deliver = held.removeValue(forKey: ordinal); lock.unlock()
+        deliver?()
+    }
+}
+
+private final class OpenCodePostBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let started: XCTestExpectation
+    private var deliver: (() -> Void)?
+    init(started: XCTestExpectation) { self.started = started }
+    func hold(_ response: @escaping () -> Void) {
+        lock.lock(); deliver = response; lock.unlock()
+        started.fulfill()
+    }
+    func release() {
+        lock.lock(); let response = deliver; deliver = nil; lock.unlock()
+        response?()
     }
 }

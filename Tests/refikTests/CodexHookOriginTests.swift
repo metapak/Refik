@@ -5,7 +5,7 @@ import RefikInteractionWire
 
 final class CodexHookOriginTests: XCTestCase {
     private let session = "01a10505-88e2-7e32-a501-c60b2215d50f"
-    private let parent = "01a08671-ed27-7ba3-b946-3a602b2e4fad"
+    private let parent = "22222222-3333-4444-8555-666666666666"
     private let helper = URL(fileURLWithPath: "/owned/refikHook")
     private let bundled = URL(fileURLWithPath: "/bundle/refikHook")
     private final class Source {

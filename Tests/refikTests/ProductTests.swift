@@ -316,19 +316,19 @@ final class ProductTests: XCTestCase {
             let event = try decoder.decode(CodexEvent.self, from: JSONSerialization.data(withJSONObject: normalized))
             XCTAssertTrue(reducer.apply(event))
         }
-        XCTAssertEqual(reducer.sessions["session"]?.pending.count, 1)
+        XCTAssertEqual(reducer.sessions["session"]?.pending, Set([try XCTUnwrap(openedTwo["requestID"] as? String)]))
         XCTAssertEqual(reducer.sessions["session"]?.state, .waitingPermission)
         var uncorrelated = base
         let unknownOne = try normalizeHook(uncorrelated, provider: "codex", event: "PermissionRequest")!
         let unknownTwo = try normalizeHook(uncorrelated, provider: "codex", event: "PermissionRequest")!
         XCTAssertNotEqual(unknownOne["requestID"] as? String, unknownTwo["requestID"] as? String)
         XCTAssertEqual(unknownOne["fidelity"] as? String, "official")
-        XCTAssertEqual(unknownOne["ttl"] as? Int, 600)
+        XCTAssertNil(unknownOne["ttl"])
         uncorrelated["tool_use_id"] = "unrelated-tool"
         let unrelated = try normalizeHook(uncorrelated, provider: "codex", event: "PostToolUse")!
         XCTAssertNotEqual(unknownOne["requestID"] as? String, unrelated["requestID"] as? String)
     }
-    @MainActor func testOfficialUnkeyedPermissionReachesAppOrangeAndExpiresUnknown() throws {
+    @MainActor func testOfficialUnkeyedPermissionRemainsPendingUntilProviderTerminalBoundary() throws {
         let base: [String: Any] = ["session_id": "app-probe", "turn_id": "turn", "tool_name": "Bash", "tool_input": ["command": "echo hi"]]
         let first = try normalizeHook(base, provider: "codex", event: "PermissionRequest")!
         let second = try normalizeHook(base, provider: "codex", event: "PermissionRequest")!
@@ -349,10 +349,10 @@ final class ProductTests: XCTestCase {
         XCTAssertEqual(app.sessions.first?.pending.count, 2)
         var reducer = StateReducer()
         reducer.apply(a); reducer.apply(b)
-        XCTAssertTrue(reducer.expire(at: a.at.addingTimeInterval(601)))
-        XCTAssertEqual(reducer.sessions["app-probe"]?.state, .unknown)
-        XCTAssertEqual(reducer.aggregate, .neutral)
-        XCTAssertTrue(reducer.sessions["app-probe"]?.pending.isEmpty ?? false)
+        XCTAssertFalse(reducer.expire(at: a.at.addingTimeInterval(601)))
+        XCTAssertEqual(reducer.sessions["app-probe"]?.state, .waitingPermission)
+        XCTAssertEqual(reducer.aggregate, .waiting)
+        XCTAssertEqual(reducer.sessions["app-probe"]?.pending.count, 2)
         let stopped = try normalizeHook(base, provider: "codex", event: "Stop")!
         let stoppedEvent = try decoder.decode(CodexEvent.self, from: JSONSerialization.data(withJSONObject: stopped))
         var completed = StateReducer()

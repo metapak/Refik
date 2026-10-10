@@ -220,9 +220,9 @@ final class ProviderRegressionTests: XCTestCase {
         let ask = try normalized(question, "PreToolUse"); reducer.apply(ask)
         reducer.apply(try normalized(missing, "PostToolUse"))
         XCTAssertEqual(reducer.aggregate, .waiting)
-        XCTAssertTrue(reducer.expire(at: ask.at.addingTimeInterval(601)))
-        XCTAssertEqual(reducer.sessions[ask.sessionID]?.state, .unknown)
-        XCTAssertTrue(reducer.sessions[ask.sessionID]!.pending.isEmpty)
+        _ = reducer.expire(at: ask.at.addingTimeInterval(601))
+        XCTAssertEqual(reducer.sessions[ask.sessionID]?.state, .waitingUser)
+        XCTAssertFalse(reducer.sessions[ask.sessionID]!.pending.isEmpty)
     }
     @MainActor func testUsageExpiryPrunesSharedStoreAndRejectsStaleIngestion() {
         let app = AppModel(inspectNotificationPermission: false), now = Date()

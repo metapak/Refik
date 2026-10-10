@@ -7,13 +7,13 @@ import RefikInteractionWire
 final class HookBridgeTransportTests: XCTestCase {
     private func temporaryBridge(monotonicNow: @escaping () -> Double = { HookWire.uptime }, onInteraction: ((CodexEvent, String) -> Void)? = nil,
                                  onInvalidation: ((RequestIdentity) -> Void)? = nil,
-                                 onAntigravityObservation: ((CodexEvent, AntigravityHookObservation) -> Void)? = nil) throws -> (HookBridge, URL) {
+                                 onAntigravityObservation: ((CodexEvent, AntigravityHookObservation) -> Void)? = nil, onEvent: ((CodexEvent) -> Void)? = nil) throws -> (HookBridge, URL) {
         let directory = URL(fileURLWithPath: "/tmp").appendingPathComponent("refik-bridge-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let bridge = HookBridge(socketURL: directory.appendingPathComponent("events.sock"),
                                 tokenURL: directory.appendingPathComponent("signal.token"),
                                 monotonicNow: monotonicNow, onInteraction: onInteraction, onInvalidation: onInvalidation,
-                                onAntigravityObservation: onAntigravityObservation, onEvent: { _ in })
+                                onAntigravityObservation: onAntigravityObservation, onEvent: { onEvent?($0) })
         bridge.start()
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline && !HookWire.secureFile(directory.appendingPathComponent("events.sock"), socket: true) {
@@ -22,7 +22,7 @@ final class HookBridgeTransportTests: XCTestCase {
         XCTAssertTrue(HookWire.secureFile(directory.appendingPathComponent("events.sock"), socket: true))
         return (bridge, directory)
     }
-    private func helper(_ directory: URL, provider: String = "claude", interactive: Bool = true, eventName: String = "PermissionRequest", payload: [String: Any]? = nil) throws -> (Process, Pipe) {
+    private func helper(_ directory: URL, provider: String = "claude", interactive: Bool = true, eventName: String = "PermissionRequest", payload: [String: Any]? = nil, diagnosticStderr: URL? = nil) throws -> (Process, Pipe) {
         let binary = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/debug/refikHook")
         guard FileManager.default.isExecutableFile(atPath: binary.path) else { throw XCTSkip("Build refikHook first") }
         let fixture = directory.appendingPathComponent(provider)
@@ -35,7 +35,10 @@ final class HookBridgeTransportTests: XCTestCase {
         process.arguments = [binary.path, provider, eventName] + (interactive ? ["--interactive", "--runtime-version=2.1.287", "--host=terminal"] : [])
         process.environment = ProcessInfo.processInfo.environment.merging(["REFIK_DATA_DIR": directory.path]) { _, new in new }
         let input = Pipe(); let output = Pipe(); process.standardInput = input; process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        if let diagnosticStderr {
+            FileManager.default.createFile(atPath: diagnosticStderr.path, contents: nil)
+            process.standardError = try FileHandle(forWritingTo: diagnosticStderr)
+        } else { process.standardError = FileHandle.nullDevice }
         try process.run()
         let body = try payload.map { try JSONSerialization.data(withJSONObject: $0) } ?? Data(#"{"session_id":"fixture-session","turn_id":"fixture-turn","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"printf fixture"}}"#.utf8)
         try input.fileHandleForWriting.write(contentsOf: body)
@@ -50,13 +53,58 @@ final class HookBridgeTransportTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 0)
         return try pipe.fileHandleForReading.readToEnd() ?? Data()
     }
+    // Failure diagnostics never wait indefinitely on our synthetic child or pipes.
+    private func stopFixture(_ process: Process) {
+        func wait(_ seconds: Double) {
+            let deadline = Date().addingTimeInterval(seconds)
+            while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        }
+        wait(2)
+        if process.isRunning { process.terminate(); wait(0.5) }
+        if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL); wait(0.5) }
+        if !process.isRunning { process.waitUntilExit() }
+    }
+    private func diagnosticBytes(_ handle: FileHandle) -> Data {
+        let fd = handle.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else { return Data() }
+        defer { _ = fcntl(fd, F_SETFL, flags) }
+        var data = Data(); var buffer = [UInt8](repeating: 0, count: 1024)
+        while data.count < 16_384 {
+            let count = Darwin.read(fd, &buffer, min(buffer.count, 16_384 - data.count))
+            guard count > 0 else { break }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+        return data
+    }
     func testAuthenticatedPermissionDeliveryAndDuplicateClick() async throws {
         let ready = expectation(description: "interactive request")
-        var event: CodexEvent?; var channel: String?
-        let (bridge, directory) = try temporaryBridge(onInteraction: { incoming, id in event = incoming; channel = id; ready.fulfill() })
+        var event: CodexEvent?; var channel: String?; var observed: CodexEvent?
+        let (bridge, directory) = try temporaryBridge(onInteraction: { incoming, id in event = incoming; channel = id; ready.fulfill() }, onEvent: { observed = $0 })
         defer { bridge.stop(); try? FileManager.default.removeItem(at: directory) }
-        let (process, pipe) = try helper(directory)
+        let stderr = directory.appendingPathComponent("helper.stderr")
+        let (process, pipe) = try helper(directory, diagnosticStderr: stderr)
+        defer {
+            bridge.stop()
+            stopFixture(process)
+            try? (process.standardError as? FileHandle)?.close()
+        }
         await fulfillment(of: [ready], timeout: 2)
+        if event == nil {
+            let status = process.isRunning ? "running" : "exited:\(process.terminationStatus)"
+            bridge.stop()
+            stopFixture(process)
+            let stdout = diagnosticBytes(pipe.fileHandleForReading)
+            let errorHandle = try FileHandle(forReadingFrom: stderr)
+            defer { try? errorHandle.close() }
+            let errors = diagnosticBytes(errorHandle)
+            let final = process.isRunning ? "still-running" : "exited:\(process.terminationStatus)"
+            let fallback = observed.map { "\($0.kind.rawValue):\($0.runtime?.id ?? "nil"):\($0.runtime?.version ?? "nil")" } ?? "none"
+            let diagnostic = "callback-timeout process=\(status) final=\(final) observation=\(fallback) stdout=\(String(decoding: stdout, as: UTF8.self)) stderr=\(String(decoding: errors, as: UTF8.self))\n"
+            let evidence = URL(fileURLWithPath: "/tmp/refik-hook-first-callback-diagnostic.txt")
+            try diagnostic.write(to: evidence, atomically: true, encoding: .utf8)
+            print(diagnostic)
+        }
         let request = try XCTUnwrap(event?.requestSnapshot); let channelID = try XCTUnwrap(channel)
         XCTAssertEqual(event?.runtime?.host, .unknown)
         XCTAssertEqual(event?.runtime?.version, "2.1.287")

@@ -63,10 +63,17 @@ enum TerminalNavigationOrigin {
         guard let sourceIndex = capture.ancestors.firstIndex(where: {
                   let path = URL(fileURLWithPath: $0.path)
                   return path.lastPathComponent == (event.provider == .antigravity ? "agy" : event.provider.rawValue) ||
+                    event.provider == .antigravity && AntigravityTerminalOrigin.isCLIExecutable($0.path) ||
                     event.provider == .claude && $0.path.contains("/claude/versions/")
               }), sourceIndex < capture.ancestors.count - 1 else { diagnostic(.bindSourceMissing); return nil }
         guard let sourceFile = operations.file(URL(fileURLWithPath: capture.ancestors[sourceIndex].path)),
               let terminalFile = operations.file(URL(fileURLWithPath: terminal.path)) else { diagnostic(.bindFilesUnavailable); return nil }
+        let source = URL(fileURLWithPath: capture.ancestors[sourceIndex].path)
+        if event.provider == .antigravity && source.lastPathComponent != "agy" {
+            guard operations.signed(source, "cli", "EQHXZ8M8AV"), operations.file(source) == sourceFile else {
+                diagnostic(.bindSourceMissing); return nil
+            }
+        }
         guard capture.ancestors.allSatisfy({ operations.process($0.pid) == $0 }) else { diagnostic(.bindAncestryChanged); return nil }
         diagnostic(.bindReady)
         let target = TerminalNavigationTarget(bundleID: host.bundleID,

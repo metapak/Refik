@@ -23,9 +23,9 @@ Kullanılabilen özellikler araca ve bağlantı biçimine göre değişir. Her a
 
 ## Kurulum
 
-**Ücretsiz beta:** 0.1.4 · macOS 13 ve üzeri · Apple Silicon (arm64)
+**Ücretsiz beta:** 0.1.5 · macOS 13 ve üzeri · Apple Silicon (arm64)
 
-**[Refik 0.1.4 indir](https://github.com/metapak/Refik/releases/download/v0.1.4/Refik-0.1.4-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.4)
+**[Refik 0.1.5 indir](https://github.com/metapak/Refik/releases/download/v0.1.5/Refik-0.1.5-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.5)
 
 1. DMG’yi açın, Refik’i **Applications / Uygulamalar** klasörüne taşıyın.
 2. Refik’i başlatıp ilk kurulumda bulunan araçları bağlayın.
@@ -44,7 +44,7 @@ Bu tablo, canlı kullanımda denenen akışları henüz gerçek hesapla doğrula
 | --- | --- | --- |
 | Codex · Visual Studio Code | Çalışıyor, bekliyor ve yanıt hazır durumları; editörü açma | Canlı denendi |
 | Codex CLI · Terminal.app / iTerm2 | Çalışıyor, bekliyor ve yanıt hazır durumları; seçilen terminali açma | Canlı denendi |
-| Codex Desktop | Etkinlik takibi ve uygulamayı açma | Uzun ve sıkıştırılmış sohbette tamamlanma/görüldü kurtarma akışı canlı denendi; belirli sohbete doğrudan geçiş doğrulanmadı |
+| Codex Desktop | Etkinlik takibi ve uygulamayı açma | Kurulu 0.1.5 paketinde tam eşleşen yerel tamamlanma/görüldü kanıtı kontrol edildi; belirli sohbete doğrudan geçiş doğrulanmadı |
 | Antigravity IDE | Çalışıyor, bekliyor ve yanıt hazır durumları; IDE’yi açma | Canlı denendi |
 | Antigravity CLI · Terminal.app / iTerm2 | Çalışıyor, bekliyor ve yanıt hazır durumları; seçilen terminali açma | Canlı denendi |
 | Cursor · Grok | Bildirim akışı | Bildirim canlı denendi; soru ve açma akışları tam doğrulanmadı |

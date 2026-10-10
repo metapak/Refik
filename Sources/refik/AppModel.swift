@@ -310,7 +310,8 @@ struct UsageEntry: Identifiable {
                 self.integrations.register(capabilities, transport: bridge, runtime: event.runtime, requestIdentity: request.identity)
                 self.requestChannels[request.identity] = channel
                 var liveEvent = event
-                liveEvent.requestSnapshot?.expiresAt = nil
+                liveEvent.verifiedHookLease = true
+                liveEvent.requestSnapshot?.expiryScope = .responseChannelLease
                 self.accept(liveEvent, historical: false)
                 self.reconcileInteractionLiveness()
             }
@@ -338,7 +339,12 @@ struct UsageEntry: Identifiable {
                 else if !focusReceiver.hasConnection { self.editorFocusMessage = "Canlı editör bağlantısı bekleniyor" }
                 self.reconcileEditorFocus()
             }
-        }, onEvent: { [weak self] event in DispatchQueue.main.async { self?.accept(event, historical: false) } })
+        }, onEvent: { [weak self] event in
+            DispatchQueue.main.async {
+                var verified = event; verified.verifiedHookLease = true
+                self?.accept(verified, historical: false)
+            }
+        })
         hookSourceRunning = true
         bridge?.start()
         expiryTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -405,7 +411,11 @@ struct UsageEntry: Identifiable {
         }
         if event.provider == .codex, event.kind == .started, event.codexNativeTurnProof == nil { codexNativeTurnProofs.removeValue(forKey: event.sessionID) }
         if let canonical = event.runtime?.canonicalSessionID { event.sessionID = canonical }
-        if event.requestSnapshot?.turnScope == .hookInvocation { event.requestSnapshot?.expiresAt = nil }
+        if event.verifiedHookLease, event.requestSnapshot != nil,
+           event.runtime?.id == event.requestSnapshot?.identity.runtimeID,
+           event.runtime?.id.hasPrefix("hook:") == true {
+            event.requestSnapshot?.expiryScope = .responseChannelLease
+        }
         if event.provider == .opencode, let capabilities = event.capabilities, capabilities.responseChannelID == nil {
             openCodeSourceConnected = false
             integrations.remove(runtimeID: capabilities.runtimeID)
@@ -529,6 +539,15 @@ struct UsageEntry: Identifiable {
             }
             updateInteraction(current, lifecycle: receipt.lifecycle)
             return InteractionSubmissionResult(lifecycle: receipt.lifecycle, errorMessage: receipt.lifecycle == .deliveryUnknown ? "Teslim doğrulanamadı. Sağlayıcıda kontrol edin." : nil)
+        } catch is OpenCodePreDispatchError {
+            guard let current = reducer.sessions[identity.sessionID]?.orderedRequests.first(where: { $0.identity == identity }),
+                  current.lifecycle == .submitting else {
+                return InteractionSubmissionResult(lifecycle: nil, errorMessage: "İstek değişti. Sağlayıcıda devam edin.")
+            }
+            updateInteraction(current, lifecycle: .pending)
+            responseErrors[identity] = "Yanıt gönderilmedi. Sağlayıcıdaki güncel isteği kontrol edin."
+            publish()
+            return InteractionSubmissionResult(lifecycle: .pending, errorMessage: responseErrors[identity])
         } catch {
             if let current = reducer.sessions[identity.sessionID]?.orderedRequests.first(where: { $0.identity == identity }),
                current.lifecycle == .submitting {

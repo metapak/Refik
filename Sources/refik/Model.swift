@@ -79,6 +79,8 @@ struct CodexEvent: Codable {
     var requestUpdate: RequestLifecycleUpdate? = nil
     var requestTurnScope: RequestTurnScope? = nil
     var runtimeState: WorkState? = nil
+    // Receiver-local attestation; excluded from wire CodingKeys.
+    var verifiedHookLease = false
     var trustedInteractionSnapshot: Bool? = nil
     var antigravityStatusline: AntigravityStatuslinePayload? = nil
 }
@@ -508,6 +510,11 @@ struct StateReducer: Codable {
     @discardableResult mutating func apply(_ input: CodexEvent, allowUnverifiedWait: Bool = false,
                                            allowActivityResume: Bool = false) -> Bool {
         var event = input
+        if event.requestSnapshot?.expiryScope == .responseChannelLease,
+           !(event.verifiedHookLease && event.runtime?.id == event.requestSnapshot?.identity.runtimeID &&
+             event.runtime?.id.hasPrefix("hook:" + event.provider.rawValue + ":") == true) {
+            event.requestSnapshot?.expiryScope = .interaction
+        }
         if let canonical = event.runtime?.canonicalSessionID {
             guard !canonical.isEmpty, canonical.count <= 160 else { return false }
             event.sessionID = canonical
@@ -814,8 +821,24 @@ struct StateReducer: Codable {
         for id in sessions.keys {
             guard var session = sessions[id], var requests = session.requestSnapshots else { continue }
             var expired = false
+            // Compatibility for the old helper's invocation-scoped snapshot.
+            // Preserve its deadline as a reply lease; ambiguous provider-turn
+            // deadlines retain their interaction expiry semantics.
+            for index in requests.indices where requests[index].expiryScope == nil &&
+                requests[index].turnScope == .hookInvocation &&
+                requests[index].identity.turnID.hasPrefix("hook:") &&
+                requests[index].identity.provider == session.provider &&
+                requests[index].identity.sessionID == session.id &&
+                requests[index].identity.runtimeID == session.runtime?.id &&
+                requests[index].identity.runtimeID.hasPrefix("hook:" + session.provider.rawValue + ":") {
+                requests[index].expiryScope = .responseChannelLease
+                session.requestSnapshots = requests; sessions[id] = session; changed = true
+            }
             for index in requests.indices where ([.pending, .submitting, .submitted, .deliveryUnknown].contains(requests[index].lifecycle)) &&
-                requests[index].expiresAt.map({ $0 <= date }) == true {
+                requests[index].expiresAt.map({ $0 <= date }) == true &&
+                !(requests[index].expiryScope == .responseChannelLease &&
+                  requests[index].identity.runtimeID == session.runtime?.id &&
+                  requests[index].identity.runtimeID.hasPrefix("hook:")) {
                 requests[index].lifecycle = .expired
                 let requestID = requests[index].id
                 session.pending.remove(requestID); session.pendingKinds.removeValue(forKey: requestID)
@@ -830,6 +853,13 @@ struct StateReducer: Codable {
         }
         for id in sessions.keys where sessions[id]?.expires.map({ $0 <= date }) == true {
             changed = true
+            if var session = sessions[id], session.provider != .opencode, session.fidelity == .official,
+               session.runtime?.id.hasPrefix("hook:" + session.provider.rawValue + ":") == true,
+               (session.state == .waitingPermission || session.state == .waitingUser) {
+                // Older helpers used a transport/observation TTL for the row.
+                // It cannot establish that the provider stopped asking.
+                session.expires = nil; sessions[id] = session; continue
+            }
             if var session = sessions[id],
                (session.provider == .codex || session.provider == .claude),
                (session.state == .waitingPermission || session.state == .waitingUser) {
@@ -974,7 +1004,6 @@ extension StateReducer {
         guard var session = sessions[identity.sessionID],
               let index = session.requestSnapshots?.firstIndex(where: { $0.identity == identity }) else { return false }
         session.capabilities?.responseChannelID = nil
-        session.requestSnapshots?[index].expiresAt = nil
         if session.requestSnapshots?[index].lifecycle == .submitting || session.requestSnapshots?[index].lifecycle == .submitted {
             session.requestSnapshots?[index].lifecycle = .deliveryUnknown
         }

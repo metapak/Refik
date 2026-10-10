@@ -544,7 +544,8 @@ final class VSCodeCodexTests: XCTestCase {
         var malformed = try XCTUnwrap(JSONSerialization.jsonObject(with: call) as? [String: Any]); malformed["timestamp"] = "invalid"
         let invalid = try JSONSerialization.data(withJSONObject: malformed)
         XCTAssertNil(parser.orderedNativeQuestionTurn(invalid)); XCTAssertTrue(parser.parseEvents(invalid).isEmpty)
-        XCTAssertFalse(parser.hasPendingBlockingQuestion)
+        XCTAssertEqual(parser.currentTurnID, "turn", "Malformed timestamp cannot change the active turn")
+        XCTAssertTrue(parser.hasPendingBlockingQuestion, "Malformed timestamp still vetoes completion proof")
         XCTAssertEqual(parser.orderedNativeQuestionTurn(call), "turn")
         XCTAssertEqual(parser.parseEvents(call).first?.turnID, "turn")
         var unknown = RolloutAdapter()

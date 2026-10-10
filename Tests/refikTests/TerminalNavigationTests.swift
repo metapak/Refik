@@ -10,7 +10,7 @@ final class TerminalNavigationTests: XCTestCase {
     private final class Fixture {
         var processes: [Int32: AntigravityTerminalOrigin.ProcessIdentity] = [:]
         var time: Double = 100
-        var signed = true, helperMatches = true
+        var signed = true, helperMatches = true, cliSigned = true
         var signatureChecks = 0
         var file: AntigravityTerminalOrigin.FileIdentity? = .init(device: 1, inode: 2, size: 3, seconds: 4, nanos: 5)
         init(_ provider: Provider = .codex, iTerm: Bool = true) {
@@ -27,6 +27,7 @@ final class TerminalNavigationTests: XCTestCase {
             .init(peer: { _ in 10 }, process: { self.processes[$0] }, file: { _ in self.file },
                   signed: { _, id, team in
                       self.signatureChecks += 1
+                      if id == "cli" { return self.cliSigned && team == "EQHXZ8M8AV" }
                       return self.signed && ((id == "com.googlecode.iterm2" && team == "H7V7XYVQ7D") || id == "com.apple.Terminal" && team == nil)
                   },
                   helperMatches: { _, _ in self.helperMatches }, now: { self.time })
@@ -212,6 +213,51 @@ final class TerminalNavigationTests: XCTestCase {
             let saved = try JSONDecoder().decode(Session.self, from: JSONEncoder().encode(s))
             XCTAssertEqual(SessionRouting.route(for: saved, terminalOperations: f.operations), route)
         }
+    }
+    func testAntigravitySignedUpdaterAliasKeepsOnlyAttestedTerminalAndTab() throws {
+        for iTerm in [false, true] {
+            let f = Fixture(.antigravity, iTerm: iTerm)
+            let alias = AntigravityTerminalOrigin.cli.path + ".1791381419993688000.old"
+            f.processes[12] = .init(pid: 12, parent: 13, uid: getuid(), seconds: 12, micros: 1, path: alias)
+            var e = event(.antigravity); e.navigationTabToken = token
+            let b = try binding(f, e)
+            TerminalNavigationOrigin.apply(b, to: &e, operations: f.operations)
+            let target = try XCTUnwrap(e.terminalNavigation)
+            XCTAssertEqual(target.bundleID, iTerm ? "com.googlecode.iterm2" : "com.apple.Terminal")
+            XCTAssertEqual(target.tabToken, iTerm ? token : nil)
+            XCTAssertEqual(TerminalNavigationOrigin.tabURL(target, operations: f.operations)?.absoluteString,
+                           iTerm ? "iterm2:reveal?sessionid=" + token : nil)
+            f.file = .init(device: 1, inode: 999, size: 3, seconds: 4, nanos: 5)
+            TerminalNavigationOrigin.apply(b, to: &e, operations: f.operations)
+            XCTAssertNil(e.terminalNavigation)
+        }
+    }
+    func testAntigravityUpdaterAliasRejectsMalformedForeignUnsignedOrChangedChain() throws {
+        let alias = AntigravityTerminalOrigin.cli.path + ".1791381419993688000.old"
+        for path in [AntigravityTerminalOrigin.cli.path + ".123.old", AntigravityTerminalOrigin.cli.path + ".0179138141999368800.old", "/foreign/agy.1791381419993688000.old", alias + "/child"] {
+            let f = Fixture(.antigravity)
+            f.processes[12] = .init(pid: 12, parent: 13, uid: getuid(), seconds: 12, micros: 1, path: path)
+            XCTAssertNil(TerminalNavigationOrigin.bind(TerminalNavigationOrigin.capture(0, helper: helper, operations: f.operations), event: event(.antigravity), helper: helper, bundledHelper: bundled, operations: f.operations))
+        }
+        for mode in 0..<4 {
+            let f = Fixture(.antigravity)
+            f.processes[12] = .init(pid: 12, parent: 13, uid: getuid(), seconds: 12, micros: 1, path: alias)
+            let capture = TerminalNavigationOrigin.capture(0, helper: helper, operations: f.operations)
+            if mode == 0 { f.cliSigned = false }
+            if mode == 1 { f.helperMatches = false }
+            if mode == 2 { f.file = nil }
+            if mode == 3 { f.processes[13] = .init(pid: 13, parent: 99, uid: getuid(), seconds: 13, micros: 1, path: "/bin/zsh") }
+            XCTAssertNil(TerminalNavigationOrigin.bind(capture, event: event(.antigravity), helper: helper, bundledHelper: bundled, operations: f.operations))
+        }
+        let replaced = Fixture(.antigravity)
+        replaced.processes[12] = .init(pid: 12, parent: 13, uid: getuid(), seconds: 12, micros: 1, path: alias)
+        var operations = replaced.operations
+        let signed = operations.signed
+        operations.signed = { url, id, team in
+            if id == "cli" { replaced.file = .init(device: 1, inode: 999, size: 3, seconds: 4, nanos: 5) }
+            return signed(url, id, team)
+        }
+        XCTAssertNil(TerminalNavigationOrigin.bind(TerminalNavigationOrigin.capture(0, helper: helper, operations: operations), event: event(.antigravity), helper: helper, bundledHelper: bundled, operations: operations))
     }
     func testTerminalAppOnlyAndLegacyRuntimeDoesNotGuessAppleTerminal() throws {
         let f = Fixture(iTerm: false); var e = event(); e.navigationTabToken = token

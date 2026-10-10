@@ -78,6 +78,8 @@ struct PermissionRequestBody: Codable, Equatable {
     let scope: String
     var explanation: String? = nil
 }
+enum RequestExpiryScope: String, Codable { case interaction, responseChannelLease }
+
 struct PendingRequestSnapshot: Codable, Equatable, Identifiable {
     var id: String { identity.requestID }
     let identity: RequestIdentity
@@ -88,6 +90,7 @@ struct PendingRequestSnapshot: Codable, Equatable, Identifiable {
     var lifecycle: RequestLifecycle = .pending
     let observedAt: Date
     var expiresAt: Date? = nil
+    var expiryScope: RequestExpiryScope? = nil
     var isValid: Bool {
         guard !identity.runtimeID.isEmpty, !identity.generation.isEmpty, !identity.requestID.isEmpty else { return false }
         switch kind {

@@ -16,7 +16,20 @@ final class FirstLaunchSetupTests: XCTestCase {
         XCTAssertEqual(lines[1], "700")
         XCTAssertEqual(lines[2], NSHomeDirectory())
         XCTAssertEqual(lines[3], "/usr/bin:/bin")
-        XCTAssertFalse(FileManager.default.fileExists(atPath: directory))
+        let diagnostic = "cleanupUncertain=\(result.cleanupUncertain) captureIncomplete=\(String(describing: result.captureIncomplete)) remainingChildren=\(String(describing: result.remainingChildren)) outputEOF=\(String(describing: result.outputEOF)) outputReadFailed=\(String(describing: result.outputReadFailed)) leaderReaped=\(String(describing: result.leaderReaped)) cwd=\(directory)"
+        print("Public CLI runner: " + diagnostic)
+        XCTAssertEqual(result.terminationCode, 0, diagnostic)
+        XCTAssertEqual(result.leaderReaped, true, diagnostic)
+        XCTAssertEqual(result.outputEOF, true, diagnostic)
+        XCTAssertEqual(result.outputReadFailed, false, diagnostic)
+        if result.cleanupUncertain {
+            XCTAssertTrue(result.captureIncomplete == true || result.remainingChildren == true, diagnostic)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: directory), diagnostic)
+        } else {
+            XCTAssertEqual(result.captureIncomplete, false, diagnostic)
+            XCTAssertEqual(result.remainingChildren, false, diagnostic)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory), diagnostic)
+        }
     }
     func testPublicCLIRunnerClassifiesFailureWithoutExposingStderrInFailureCode() {
         let failed = EditorFocusInstaller.run(URL(fileURLWithPath: "/bin/sh"), ["-c", "printf private-detail >&2; exit 7"])

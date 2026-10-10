@@ -1,6 +1,12 @@
 import Foundation
 import CryptoKit
 
+// This failure proves the response POST was never dispatched. Callers can
+// restore the same pending request without guessing about delivery.
+struct OpenCodePreDispatchError: Error {
+    let underlying: Error
+}
+
 actor OpenCodeAdapter: InteractionResponseTransport {
     private let configuration: OpenCodeConnectionConfiguration
     private let session: URLSession
@@ -13,6 +19,7 @@ actor OpenCodeAdapter: InteractionResponseTransport {
     private var canSelect = false
     private var pending: [String: PendingRequestSnapshot] = [:]
     private var submitting: Set<RequestIdentity> = []
+    private var dispatched: Set<RequestIdentity> = []
     private var sessionInfo: [String: OpenCodeWireSession] = [:]
     private var lastStatus: [String: String] = [:]
     private var sourceContextID: String {
@@ -61,7 +68,7 @@ actor OpenCodeAdapter: InteractionResponseTransport {
     func stop() {
         worker?.cancel(); worker = nil
         epoch = UUID()
-        for identity in submitting {
+        for identity in dispatched {
             deliveryUnknown.insert(identity)
             if let key = pending.first(where: { $0.value.identity == identity })?.key {
                 pending[key]?.lifecycle = .deliveryUnknown
@@ -136,6 +143,12 @@ actor OpenCodeAdapter: InteractionResponseTransport {
     }
 
     func refresh() async throws {
+        _ = try await refreshSnapshot()
+    }
+
+    // A newer authoritative read supersedes this result without disconnecting
+    // the healthy stream. Submission requires a read that actually committed.
+    private func refreshSnapshot() async throws -> Bool {
         guard connected else { throw OpenCodeConnectionError.disconnected }
         let token = epoch
         refreshRevision += 1
@@ -144,7 +157,8 @@ actor OpenCodeAdapter: InteractionResponseTransport {
         let permissions: [OpenCodeWirePermission] = try await decode("/permission")
         let sessions: [OpenCodeWireSession] = try await decode("/session")
         let statuses = try await json("/session/status") as? [String: [String: Any]] ?? [:]
-        guard token == epoch, revision == refreshRevision, connected, !Task.isCancelled else { throw CancellationError() }
+        guard token == epoch, connected, !Task.isCancelled else { throw CancellationError() }
+        guard revision == refreshRevision else { return false }
         sessionInfo = Dictionary(sessions.filter { $0.directory == configuration.projectDirectory }.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var next: [String: PendingRequestSnapshot] = [:]
         for item in questions where sessionInfo[item.sessionID] != nil {
@@ -190,6 +204,7 @@ actor OpenCodeAdapter: InteractionResponseTransport {
         for (key, old) in pending where next[key] == nil { emitResolution(old, lifecycle: .resolved); deliveryUnknown.remove(old.identity) }
         for (key, request) in next where pending[key] != request && request.isValid { emitRequest(request) }
         pending = next.filter { $0.value.isValid }
+        return true
 
     }
 
@@ -201,15 +216,25 @@ actor OpenCodeAdapter: InteractionResponseTransport {
     }
 
     func submit(_ response: InteractionResponse, channelID: String) async throws -> ResponseReceipt {
-        guard connected, self.channelID == channelID else { throw OpenCodeConnectionError.disconnected }
+        guard connected, self.channelID == channelID else { throw OpenCodePreDispatchError(underlying: OpenCodeConnectionError.disconnected) }
         guard !submitting.contains(response.identity) else { throw OpenCodeConnectionError.duplicateSubmission }
         submitting.insert(response.identity)
-        defer { submitting.remove(response.identity) }
-        try await refresh()
-        guard let entry = pending.first(where: { $0.value.identity == response.identity }), response.isValid(for: entry.value) else {
-            throw OpenCodeConnectionError.staleRequest
+        defer { submitting.remove(response.identity); dispatched.remove(response.identity) }
+        let entry: Dictionary<String, PendingRequestSnapshot>.Element
+        do {
+            var refreshed = false
+            for _ in 0..<3 {
+                if try await refreshSnapshot() { refreshed = true; break }
+            }
+            guard refreshed else { throw OpenCodeConnectionError.staleRequest }
+            guard let current = pending.first(where: { $0.value.identity == response.identity }), response.isValid(for: current.value) else {
+                throw OpenCodeConnectionError.staleRequest
+            }
+            guard connected, self.channelID == channelID else { throw OpenCodeConnectionError.disconnected }
+            entry = current
+        } catch {
+            throw OpenCodePreDispatchError(underlying: error)
         }
-        guard connected, self.channelID == channelID else { throw OpenCodeConnectionError.disconnected }
         let request = entry.value
         let payload: [String: Any]
         let path: String
@@ -230,6 +255,7 @@ actor OpenCodeAdapter: InteractionResponseTransport {
         pending[entry.key]?.lifecycle = .submitting
         emitResolution(request, lifecycle: .submitting)
         let data: Data
+        dispatched.insert(request.identity)
         do { data = try await send(path, method: "POST", body: payload) }
         catch OpenCodeConnectionError.http(404) {
             try? await refresh()
@@ -237,7 +263,7 @@ actor OpenCodeAdapter: InteractionResponseTransport {
         } catch {
             if token == epoch, connected {
                 deliveryUnknown.insert(request.identity)
-                pending[entry.key]?.lifecycle = .deliveryUnknown
+                if pending[entry.key]?.identity == request.identity { pending[entry.key]?.lifecycle = .deliveryUnknown }
                 emitResolution(request, lifecycle: .deliveryUnknown)
             }
             throw error
@@ -247,9 +273,15 @@ actor OpenCodeAdapter: InteractionResponseTransport {
         // A successful HTTP transport without that acknowledgment is unresolved.
         guard (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) as? Bool == true else {
             deliveryUnknown.insert(request.identity)
-            pending[entry.key]?.lifecycle = .deliveryUnknown
+            if pending[entry.key]?.identity == request.identity { pending[entry.key]?.lifecycle = .deliveryUnknown }
             emitResolution(request, lifecycle: .deliveryUnknown)
             throw OpenCodeConnectionError.unconfirmedResponse
+        }
+        if let current = pending[entry.key] {
+            guard current.identity == request.identity,
+                  current.question == request.question, current.permission == request.permission else {
+                throw OpenCodeConnectionError.staleRequest
+            }
         }
         refreshRevision += 1
         pending.removeValue(forKey: entry.key)
@@ -268,7 +300,7 @@ actor OpenCodeAdapter: InteractionResponseTransport {
 
     private func announceDisconnection() {
         refreshRevision += 1
-        for identity in submitting {
+        for identity in dispatched {
             deliveryUnknown.insert(identity)
             if let key = pending.first(where: { $0.value.identity == identity })?.key, let request = pending[key] {
                 pending[key]?.lifecycle = .deliveryUnknown

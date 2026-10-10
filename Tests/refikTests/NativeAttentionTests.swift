@@ -533,11 +533,13 @@ final class NativeAttentionTests: XCTestCase {
         }
     }
     func testOptInCurrentDesktopReadOnlyPrecisionDryRun() throws {
-        guard ProcessInfo.processInfo.environment["REFIK_TEST_CURRENT_NATIVE_ATTENTION"] == "1" else { throw XCTSkip("explicit local metadata dry-run only") }
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["REFIK_TEST_CURRENT_NATIVE_ATTENTION"] == "1" else { throw XCTSkip("explicit local metadata dry-run only") }
+        guard let sid = environment["REFIK_EXPECTED_SESSION_ID"] else { throw XCTSkip("REFIK_EXPECTED_SESSION_ID is required for the opt-in current native attention dry-run") }
+        guard UUID(uuidString: sid) != nil else { return XCTFail("REFIK_EXPECTED_SESSION_ID must be a valid UUID") }
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
         let state = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/refik/attention-state.json")
         let reducer = try JSONDecoder().decode(StateReducer.self, from: Data(contentsOf: state))
-        let sid = "01a08671-ed27-7ba3-b946-3a602b2e4fad"
         let session = try XCTUnwrap(reducer.sessions[sid])
         let database = root.appendingPathComponent("state_5.sqlite")
         var db: OpaquePointer?, stmt: OpaquePointer?

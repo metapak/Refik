@@ -374,10 +374,41 @@ final class EditorFocusTests: XCTestCase {
         var records = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: receipts))
         XCTAssertNotNil(records[installation.application.path]); XCTAssertEqual(records["foreign-app"], "foreign-receipt")
         XCTAssertEqual(try Data(contentsOf: settings), foreign); XCTAssertFalse(commands.flatMap {$0}.contains("--force"))
+        let validReceipt = try Data(contentsOf: receipts)
+        let script = installed.appendingPathComponent("extension.js")
+        let metadata = root.appendingPathComponent("extensions.json")
+        let originalScript = try Data(contentsOf: script), originalMetadata = try Data(contentsOf: metadata)
+        for mode in 0..<3 {
+            if mode == 0 { try Data("replaced script".utf8).write(to: script) }
+            if mode == 1 {
+                try JSONSerialization.data(withJSONObject: [["identifier": ["id": "refik.editor-focus"], "version": "9.0.0", "location": ["scheme": "file", "fsPath": installed.path]]]).write(to: metadata)
+            }
+            if mode == 2 {
+                var mismatched = records; mismatched[installation.application.path] = "different-checksum"
+                try JSONEncoder().encode(mismatched).write(to: receipts)
+            }
+            let receiptBefore = try Data(contentsOf: receipts), scriptBefore = try Data(contentsOf: script), metadataBefore = try Data(contentsOf: metadata)
+            var attempted: [[String]] = []
+            let refusal = EditorFocusInstaller.configure(enabled: false, archive: archive, receiptURL: receipts, installations: [installation], verified: {_ in true}, runner: { _, args in
+                attempted.append(args)
+                return .init(success: true, output: "refik.editor-focus@" + (mode == 1 ? "9.0.0" : "0.1.0"))
+            }, extensionRoot: { _ in root }, executableAvailable: { _ in true })
+            XCTAssertTrue(refusal.contains("korunuyor"))
+            XCTAssertFalse(attempted.contains { $0.first == "--uninstall-extension" })
+            XCTAssertEqual(try Data(contentsOf: receipts), receiptBefore)
+            XCTAssertEqual(try Data(contentsOf: script), scriptBefore)
+            XCTAssertEqual(try Data(contentsOf: metadata), metadataBefore)
+            try originalScript.write(to: script); try originalMetadata.write(to: metadata); try validReceipt.write(to: receipts)
+        }
         let removed = EditorFocusInstaller.configure(enabled: false, archive: archive, receiptURL: receipts, installations: [installation], verified: {_ in true}, runner: runner, extensionRoot: { _ in root }, executableAvailable: { _ in true })
         XCTAssertTrue(removed.contains("kaldırıldı")); XCTAssertEqual(extensions, ["foreign.tool@1.0"])
         records = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: receipts))
         XCTAssertEqual(records, ["foreign-app": "foreign-receipt"]); XCTAssertFalse(FileManager.default.fileExists(atPath: installed.path))
+        try validReceipt.write(to: receipts); commands = []
+        let absent = EditorFocusInstaller.configure(enabled: false, archive: archive, receiptURL: receipts, installations: [installation], verified: {_ in true}, runner: runner, extensionRoot: { _ in root }, executableAvailable: { _ in true })
+        XCTAssertTrue(absent.contains("kaldırıldı"))
+        XCTAssertFalse(commands.contains { $0.first == "--uninstall-extension" })
+        XCTAssertEqual(try JSONDecoder().decode([String: String].self, from: Data(contentsOf: receipts)), ["foreign-app": "foreign-receipt"])
         let preservedReceipt = try Data(contentsOf: receipts)
         extensions.insert("refik.editor-focus@0.1.0"); commands = []
         let collision = EditorFocusInstaller.configure(enabled: true, archive: archive, receiptURL: receipts, installations: [installation], verified: {_ in true}, runner: runner, extensionRoot: { _ in root }, executableAvailable: { _ in true })
