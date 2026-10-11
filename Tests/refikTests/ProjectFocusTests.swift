@@ -11,9 +11,9 @@ final class ProjectFocusTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         try body(first, second)
     }
-    private func event(_ id: String, provider: Provider, kind: EventKind, path: String?, time: Double, turn: String = "turn") -> CodexEvent {
+    private func event(_ id: String, provider: Provider, kind: EventKind, path: String?, time: Double, turn: String = "turn", title: String = "Same basename") -> CodexEvent {
         var e = CodexEvent(sessionID: id, turnID: turn, requestID: kind == .userQuestionObserved ? "question" : nil,
-            kind: kind, source: .unknown, title: "Same basename", at: Date(timeIntervalSince1970: time), id: UUID().uuidString)
+            kind: kind, source: .unknown, title: title, at: Date(timeIntervalSince1970: time), id: UUID().uuidString)
         e.provider = provider; e.projectPath = path; return e
     }
     func testCanonicalIdentityResolvesSymlinkRepositoryRootAndLocalFileURLRejectsRemoteUnknown() throws {
@@ -73,6 +73,53 @@ final class ProjectFocusTests: XCTestCase {
             var focus = ProjectFocusCorrelation()
             XCTAssertNil(focus.observe(nil, at: Date()))
             XCTAssertNil(focus.observe(ProjectFocusObservation(projectPath: nil), at: Date()))
+        }
+    }
+    func testClaudeSessionMetadataCannotReplaceCompletedOutcomeOrStableProjectLabel() throws {
+        try fixture { project, otherProject in
+            let build = project.appendingPathComponent("Builds")
+            try FileManager.default.createDirectory(at: build, withIntermediateDirectories: true)
+            var reducer = StateReducer()
+            let started = event("claude-project", provider: .claude, kind: .started, path: project.path, time: 1, title: "Istiklal.Unity")
+            var completed = event("claude-project", provider: .claude, kind: .completed, path: project.path, time: 2, title: "Istiklal.Unity")
+            completed.detail = "İş tamamlandı"
+            XCTAssertTrue(reducer.apply(started)); XCTAssertTrue(reducer.apply(completed))
+            let before = try XCTUnwrap(reducer.sessions["claude-project"])
+
+            var sessionStart = event("claude-project", provider: .claude, kind: .unknownEvent, path: build.path, time: 3, title: "Builds")
+            sessionStart.detail = "Bilinmeyen olay: SessionStart"
+            XCTAssertTrue(reducer.apply(sessionStart))
+            let after = try XCTUnwrap(reducer.sessions["claude-project"])
+            XCTAssertEqual(after.state, .completed)
+            XCTAssertEqual(after.seen, false)
+            XCTAssertEqual(after.updated, before.updated)
+            XCTAssertEqual(after.projectPath, ProjectIdentity.canonical(project.path))
+            XCTAssertEqual(after.title, "Istiklal.Unity")
+            XCTAssertEqual(after.detail, "İş tamamlandı")
+
+            // A real new prompt is a new lifecycle and may correctly bind a
+            // different project, without changing the old completed outcome.
+            let next = event("claude-project", provider: .claude, kind: .started, path: otherProject.path, time: 4, turn: "next", title: "other")
+            XCTAssertTrue(reducer.apply(next))
+            XCTAssertEqual(reducer.sessions["claude-project"]?.state, .running)
+            XCTAssertEqual(reducer.sessions["claude-project"]?.projectPath, ProjectIdentity.canonical(otherProject.path))
+            XCTAssertEqual(reducer.sessions["claude-project"]?.title, "other")
+        }
+    }
+    func testClaudeSeparateSessionIDsKeepIndependentStableProjectLabels() throws {
+        try fixture { first, second in
+            let firstNested = first.appendingPathComponent("Builds")
+            try FileManager.default.createDirectory(at: firstNested, withIntermediateDirectories: true)
+            var reducer = StateReducer()
+            let one = event("claude-one", provider: .claude, kind: .started, path: first.path, time: 1, title: "first")
+            let two = event("claude-two", provider: .claude, kind: .started, path: second.path, time: 1, title: "second")
+            XCTAssertTrue(reducer.apply(one)); XCTAssertTrue(reducer.apply(two))
+            let metadata = event("claude-one", provider: .claude, kind: .unknownEvent, path: firstNested.path, time: 2, title: "Builds")
+            XCTAssertTrue(reducer.apply(metadata))
+            XCTAssertEqual(reducer.sessions["claude-one"]?.projectPath, ProjectIdentity.canonical(first.path))
+            XCTAssertEqual(reducer.sessions["claude-one"]?.title, "first")
+            XCTAssertEqual(reducer.sessions["claude-two"]?.projectPath, ProjectIdentity.canonical(second.path))
+            XCTAssertEqual(reducer.sessions["claude-two"]?.title, "second")
         }
     }
     private func window(_ id: Int, pid: Int = 99, title: String = "Cursor Agents", onScreen: Bool = true) -> [String: Any] {

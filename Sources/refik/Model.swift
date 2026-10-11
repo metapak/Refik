@@ -599,6 +599,7 @@ struct StateReducer: Codable {
                       event.kind != .activity || allowActivityResume else { return false }
             }
         }
+        let existingSession = sessions[event.sessionID] != nil
         var s = sessions[event.sessionID] ?? Session(id: event.sessionID, turnID: event.turnID, source: event.source,
             title: event.title ?? "Codex oturumu", state: .unknown, started: event.at, updated: event.at)
         if event.kind == .started && event.provider == .signal &&
@@ -684,7 +685,14 @@ struct StateReducer: Codable {
         }
         s.lastEventIDs.insert(event.id)
         if s.lastEventIDs.count > 200 { s.lastEventIDs = Set(s.lastEventIDs.sorted().suffix(100)) }
-        if event.kind != .reconciledRunning { s.updated = max(s.updated, event.at) }
+        // Claude's SessionStart is metadata, not a new answer or result. It can
+        // arrive after Stop from a helper which is still winding down. Do not
+        // let that receipt move a completed outcome forward: doing so changes
+        // the relative time and invalidates the completion identity used by
+        // focus acknowledgement.
+        let preservesTerminalOutcome = [.completed, .failed, .interrupted].contains(s.state) &&
+            [.activity, .unknownEvent].contains(event.kind)
+        if event.kind != .reconciledRunning && !preservesTerminalOutcome { s.updated = max(s.updated, event.at) }
         if event.source != .unknown { s.source = event.source }
         if let observation = event.codexOriginObservation { s.codexOriginObservation = observation }
         let previousRuntimeContext = s.runtime?.sourceContextID
@@ -694,7 +702,13 @@ struct StateReducer: Codable {
             s.runtime = runtime
         }
         if let capabilities = event.capabilities, capabilities.provider == event.provider { s.capabilities = capabilities }
-        if let path = ProjectIdentity.canonical(event.projectPath) { s.projectPath = path }
+        // A terminal agent can cd into build/output folders while one prompt is
+        // in progress. Claude has one stable project identity per prompt; a
+        // later lifecycle/metadata hook must not replace it with an incidental
+        // cwd such as "Builds". A new prompt deliberately resets projectPath
+        // above, so its started event is still allowed to establish a new root.
+        let mayAdoptClaudeIdentity = event.provider != .claude || !existingSession || event.kind == .started
+        if mayAdoptClaudeIdentity, let path = ProjectIdentity.canonical(event.projectPath) { s.projectPath = path }
         if let host = event.verifiedEditorHost { s.verifiedEditorHost = host }
         if let target = event.terminalNavigation { s.terminalNavigation = target }
         if event.verifiedEditorHost != nil || event.runtime.map({ [.vscode, .codexDesktop, .cursor, .windsurf, .antigravity].contains($0.host) }) == true {
@@ -710,7 +724,7 @@ struct StateReducer: Codable {
         }
         if let progress = event.progress { s.progress = progress }
         if let ttl = event.ttl { s.expires = event.at.addingTimeInterval(ttl) }
-        if let title = event.title, !title.isEmpty { s.title = title }
+        if mayAdoptClaudeIdentity, let title = event.title, !title.isEmpty { s.title = title }
         switch event.kind {
         case .started:
             s.providerAttention = nil
@@ -786,7 +800,12 @@ struct StateReducer: Codable {
             if event.fidelity == .official { s.officiallyEnded = true }
             s.pending.removeAll(); s.pendingKinds.removeAll(); s.pendingMatchKeys.removeAll(); s.expireRequests(); s.expires = nil
             if s.state == .running || s.state == .waitingPermission || s.state == .waitingUser { s.state = .unknown }
-        case .unknownEvent: s.detail = event.detail ?? "Bilinmeyen sağlayıcı olayı"
+        case .unknownEvent:
+            // Unknown lifecycle metadata must never overwrite a completed
+            // terminal result. In particular, Claude SessionStart is emitted
+            // around terminal startup and is not evidence that the user has
+            // seen, replaced, or reopened a prior completed turn.
+            if !preservesTerminalOutcome { s.detail = event.detail ?? "Bilinmeyen sağlayıcı olayı" }
         case .dropped, .usage: break
         }
         if [.opencode, .antigravity].contains(event.provider), event.fidelity == .official,
