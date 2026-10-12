@@ -106,6 +106,46 @@ final class ProjectFocusTests: XCTestCase {
             XCTAssertEqual(reducer.sessions["claude-project"]?.title, "other")
         }
     }
+    func testClaudeTransientInitialMetadataCannotSetProjectUntilStartedRootIdentity() throws {
+        try fixture { project, otherProject in
+            let build = project.appendingPathComponent("Builds")
+            let otherBuild = otherProject.appendingPathComponent("Builds")
+            try FileManager.default.createDirectory(at: project.appendingPathComponent(".git"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: build, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: otherProject.appendingPathComponent(".git"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: otherBuild, withIntermediateDirectories: true)
+            var reducer = StateReducer()
+
+            // Claude documents cwd as the directory at which each hook fired.
+            // Session metadata can therefore be emitted from a child build/report
+            // directory before the user's prompt establishes this session's root.
+            let transient = event("claude-project", provider: .claude, kind: .unknownEvent,
+                                  path: build.path, time: 1, title: "Builds")
+            XCTAssertTrue(reducer.apply(transient))
+            XCTAssertNil(reducer.sessions["claude-project"]?.projectPath)
+            XCTAssertEqual(reducer.sessions["claude-project"]?.title, "Codex oturumu")
+
+            let root = event("claude-project", provider: .claude, kind: .started,
+                             path: project.path, time: 2, title: "Istiklal.Unity")
+            XCTAssertTrue(reducer.apply(root))
+            XCTAssertEqual(reducer.sessions["claude-project"]?.projectPath, ProjectIdentity.canonical(project.path))
+            XCTAssertEqual(reducer.sessions["claude-project"]?.title, "Istiklal.Unity")
+
+            let secondTransient = event("claude-other", provider: .claude, kind: .unknownEvent,
+                                        path: otherBuild.path, time: 1, title: "Builds")
+            XCTAssertTrue(reducer.apply(secondTransient))
+            XCTAssertNil(reducer.sessions["claude-other"]?.projectPath)
+            XCTAssertEqual(reducer.sessions["claude-other"]?.title, "Codex oturumu")
+            let secondRoot = event("claude-other", provider: .claude, kind: .started,
+                                   path: otherProject.path, time: 2, title: "other")
+            XCTAssertTrue(reducer.apply(secondRoot))
+
+            XCTAssertEqual(reducer.sessions["claude-project"]?.projectPath, ProjectIdentity.canonical(project.path))
+            XCTAssertEqual(reducer.sessions["claude-project"]?.title, "Istiklal.Unity")
+            XCTAssertEqual(reducer.sessions["claude-other"]?.projectPath, ProjectIdentity.canonical(otherProject.path))
+            XCTAssertEqual(reducer.sessions["claude-other"]?.title, "other")
+        }
+    }
     func testClaudeSeparateSessionIDsKeepIndependentStableProjectLabels() throws {
         try fixture { first, second in
             let firstNested = first.appendingPathComponent("Builds")

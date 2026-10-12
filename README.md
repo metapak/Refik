@@ -23,9 +23,9 @@ Three looks, the same status signals. Choose one in Settings → Appearance.
 
 ## Install
 
-**Free beta:** 0.1.7 · macOS 13 or later · Apple Silicon (arm64)
+**Free beta:** 0.1.8 · macOS 13 or later · Apple Silicon (arm64)
 
-**[Download Refik 0.1.7](https://github.com/metapak/Refik/releases/download/v0.1.7/Refik-0.1.7-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.7)
+**[Download Refik 0.1.8](https://github.com/metapak/Refik/releases/download/v0.1.8/Refik-0.1.8-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.8)
 
 1. Open the DMG and drag Refik to **Applications**.
 2. Launch Refik and connect the tools found by the first-launch setup.
@@ -36,11 +36,11 @@ The current build is ad hoc signed and has not been notarized by Apple. macOS ma
 
 For terminal jobs, select Terminal.app or iTerm2 on the activity row when needed. Opening an application does not guarantee selecting a particular chat, window or terminal session.
 
-### 0.1.7 notes
+### 0.1.8 notes
 
-- A completed Codex Desktop card is retired only when Refik can prove a newer root turn in the exact same local project. The older result remains unseen; unrelated, archived or ambiguous turns cannot dismiss it.
-- Claude Code `Stop` events with omitted optional background-task fields now finish a terminal job. Explicitly reported background work keeps it working. If a provider never sends its final event, Refik keeps the job active rather than guessing that it ended.
-- Usage rows name their time window and mark derived local values. They describe a local snapshot only; Refik cannot read or change your account quota.
+- Claude Code cards no longer take their project label from early session metadata emitted in a child build or report directory. Refik waits for the submitted prompt's `started` event to establish the session's project root and title.
+
+This preserves independent names for concurrent Claude sessions and prevents transient child directories such as `Builds` from becoming the displayed project.
 
 ## Current support
 

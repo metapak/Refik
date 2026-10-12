@@ -622,9 +622,14 @@ struct StateReducer: Codable {
                       event.kind != .activity || allowActivityResume else { return false }
             }
         }
-        let existingSession = sessions[event.sessionID] != nil
+        // Claude's common hook cwd is only the directory at which that event
+        // fired. Do not let initial SessionStart/metadata from a child build or
+        // report directory create the card's project identity. A submitted
+        // prompt (`started`) is the first lifecycle event allowed to bind it.
+        let mayAdoptClaudeIdentity = event.provider != .claude || event.kind == .started
         var s = sessions[event.sessionID] ?? Session(id: event.sessionID, turnID: event.turnID, source: event.source,
-            title: event.title ?? "Codex oturumu", state: .unknown, started: event.at, updated: event.at)
+            title: mayAdoptClaudeIdentity ? (event.title ?? "Codex oturumu") : "Codex oturumu",
+            state: .unknown, started: event.at, updated: event.at)
         if event.kind == .started && event.provider == .signal &&
             [.completed, .failed, .interrupted, .idle, .unknown].contains(s.state) {
             s.lastEventIDs.removeAll()
@@ -730,7 +735,6 @@ struct StateReducer: Codable {
         // later lifecycle/metadata hook must not replace it with an incidental
         // cwd such as "Builds". A new prompt deliberately resets projectPath
         // above, so its started event is still allowed to establish a new root.
-        let mayAdoptClaudeIdentity = event.provider != .claude || !existingSession || event.kind == .started
         if mayAdoptClaudeIdentity, let path = ProjectIdentity.canonical(event.projectPath) { s.projectPath = path }
         if let host = event.verifiedEditorHost { s.verifiedEditorHost = host }
         if let target = event.terminalNavigation { s.terminalNavigation = target }
