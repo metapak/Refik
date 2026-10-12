@@ -76,10 +76,78 @@ final class ProviderRegressionTests: XCTestCase {
             reducer.apply(try normalized(base.merging(["prompt_id": "next"]) { _, new in new }, "UserPromptSubmit"))
             XCTAssertEqual(reducer.aggregate, .running); XCTAssertTrue(reducer.sessions[notification.sessionID]!.pending.isEmpty)
         }
-        for type in ["idle_prompt", "auth_success"] {
-            XCTAssertTrue(try normalizationOutput(base.merging(["notification_type": type]) { _, new in new }, "Notification").isEmpty)
-        }
+        XCTAssertEqual(try normalized(base.merging(["notification_type": "idle_prompt"]) { _, new in new }, "Notification").kind, .idlePrompt)
+        XCTAssertTrue(try normalizationOutput(base.merging(["notification_type": "auth_success"]) { _, new in new }, "Notification").isEmpty)
         XCTAssertEqual(try normalized(base.merging(["notification_type": "permission_prompt"]) { _, new in new }, "Notification").kind, .permissionObserved)
+    }
+    func testClaudeIdlePromptCompletesForegroundWithoutErasingPendingRequest() throws {
+        let idlePayload = base.merging(["notification_type": "idle_prompt", "message": "  Ready\n\u{0000}  now  "]) { _, new in new }
+
+        var completed = StateReducer()
+        completed.apply(try normalized(base, "UserPromptSubmit"))
+        let idle = try normalized(idlePayload, "Notification")
+        XCTAssertEqual(idle.kind, .idlePrompt)
+        XCTAssertEqual(idle.detail, "Ready now")
+        XCTAssertTrue(completed.apply(idle))
+        XCTAssertEqual(completed.aggregate, .completed)
+
+        var waiting = StateReducer()
+        waiting.apply(try normalized(base, "UserPromptSubmit"))
+        let questionEvent = try normalized(question, "PreToolUse")
+        waiting.apply(questionEvent)
+        let waitingIdle = try normalized(idlePayload, "Notification")
+        XCTAssertTrue(waiting.apply(waitingIdle))
+        XCTAssertEqual(waiting.aggregate, .waiting)
+        XCTAssertEqual(waiting.sessions[waitingIdle.sessionID]?.pending, [questionEvent.requestID!])
+    }
+    func testPromptlessClaudeNotificationCorrelatesOnlyToItsCurrentLiveSession() throws {
+        var reducer = StateReducer()
+        reducer.apply(try normalized(base, "UserPromptSubmit"))
+        var promptless = idlePayload()
+        promptless.removeValue(forKey: "prompt_id")
+        let idle = try normalized(promptless, "Notification")
+        XCTAssertTrue(idle.missingTurnIdentity == true)
+        XCTAssertTrue(reducer.apply(idle))
+        XCTAssertEqual(reducer.sessions[idle.sessionID]?.turnID, "prompt")
+        XCTAssertEqual(reducer.aggregate, .completed)
+    }
+    func testClaudeBackgroundStopBlocksPromptlessIdleUntilAuthoritativeCompletion() throws {
+        var reducer = StateReducer(); reducer.apply(try normalized(base, "UserPromptSubmit"))
+        let busyStop = try normalized(base.merging(["background_tasks": [["id": "worker"]]]) { _, new in new }, "Stop")
+        XCTAssertEqual(busyStop.kind, .activity); XCTAssertEqual(busyStop.claudeBackgroundActive, true)
+        XCTAssertTrue(reducer.apply(busyStop))
+        var promptless = idlePayload(); promptless.removeValue(forKey: "prompt_id")
+        XCTAssertTrue(reducer.apply(try normalized(promptless, "Notification")))
+        XCTAssertEqual(reducer.aggregate, .running)
+        XCTAssertEqual(reducer.sessions[busyStop.sessionID]?.claudeBackgroundActive, true)
+        let terminal = try normalized(base.merging(["background_tasks": [], "session_crons": []]) { _, new in new }, "Stop")
+        XCTAssertEqual(terminal.kind, .completed); XCTAssertTrue(reducer.apply(terminal))
+        XCTAssertEqual(reducer.aggregate, .completed)
+        XCTAssertNil(reducer.sessions[terminal.sessionID]?.claudeBackgroundActive)
+    }
+    func testClaudeAgentCompletedIsVisibleActivityNotTurnCompletion() throws {
+        var reducer = StateReducer(); reducer.apply(try normalized(base, "UserPromptSubmit"))
+        let event = try normalized(base.merging(["notification_type": "agent_completed", "message": " Worker\nfinished "]) { _, new in new }, "Notification")
+        XCTAssertEqual(event.kind, .activity); XCTAssertEqual(event.detail, "Worker finished")
+        XCTAssertTrue(reducer.apply(event))
+        XCTAssertEqual(reducer.aggregate, .running)
+        XCTAssertEqual(reducer.sessions[event.sessionID]?.detail, "Worker finished")
+    }
+    func testPromptlessClaudeAgentCompletedRendersDetailWithoutClearingPendingQuestion() throws {
+        var reducer = StateReducer(); reducer.apply(try normalized(base, "UserPromptSubmit"))
+        let questionEvent = try normalized(question, "PreToolUse"); reducer.apply(questionEvent)
+        var payload = base.merging(["notification_type": "agent_completed", "message": "Subagent finished"]) { _, new in new }
+        payload.removeValue(forKey: "prompt_id")
+        let event = try normalized(payload, "Notification")
+        XCTAssertTrue(reducer.apply(event))
+        let session = try XCTUnwrap(reducer.sessions[event.sessionID])
+        XCTAssertEqual(session.state, .waitingUser)
+        XCTAssertEqual(session.pending, [questionEvent.requestID!])
+        XCTAssertEqual(session.detail, "Subagent finished")
+        XCTAssertFalse(session.seen)
+    }
+    private func idlePayload() -> [String: Any] {
+        base.merging(["notification_type": "idle_prompt", "message": "Ready"]) { _, new in new }
     }
     private let base: [String: Any] = ["session_id": "session", "prompt_id": "prompt", "cwd": "/tmp/project"]
     private var question: [String: Any] {

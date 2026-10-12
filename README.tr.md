@@ -23,9 +23,9 @@ Kullanılabilen özellikler araca ve bağlantı biçimine göre değişir. Her a
 
 ## Kurulum
 
-**Ücretsiz beta:** 0.1.8 · macOS 13 ve üzeri · Apple Silicon (arm64)
+**Ücretsiz beta:** 0.1.9 · macOS 13 ve üzeri · Apple Silicon (arm64)
 
-**[Refik 0.1.8 indir](https://github.com/metapak/Refik/releases/download/v0.1.8/Refik-0.1.8-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.8)
+**[Refik 0.1.9 indir](https://github.com/metapak/Refik/releases/download/v0.1.9/Refik-0.1.9-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.9)
 
 1. DMG’yi açın, Refik’i **Applications / Uygulamalar** klasörüne taşıyın.
 2. Refik’i başlatıp ilk kurulumda bulunan araçları bağlayın.
@@ -36,11 +36,11 @@ Mevcut paket ad hoc imzalıdır; Apple noter onayı yoktur. macOS, doğrulanmam�
 
 Terminal işleri için gerektiğinde ilgili satırdan Terminal.app veya iTerm2’yi seçin. Uygulamayı açmak, her araçta belirli bir sohbeti, pencereyi veya terminal oturumunu doğrudan seçmek anlamına gelmez.
 
-### 0.1.8 notları
+### 0.1.9 notları
 
-- Claude Code kartları, erken oturum bilgisinin bir alt derleme veya rapor klasöründe gelmesiyle proje adını artık bu geçici klasörden almaz. Refik, oturumun proje kökünü ve başlığını kurmak için kullanıcının gönderdiği istemdeki `started` olayını bekler.
+- Claude Code’un belgelenmiş `idle_prompt` bildirimi artık eşleşen ön plan terminal turunu, `prompt_id` gelmeyen payload’larda da tamamlar. Arka plan işleri ve çözülmemiş sorular yetkili bir terminal bitiş olayı gelene kadar etkin kalır.
 
-Bu davranış, eşzamanlı Claude oturumlarının adlarını birbirinden bağımsız tutar ve `Builds` gibi geçici alt klasörlerin görünür proje adı olmasını engeller.
+Bu, biten terminal işinin çalışıyor durumda kalmasını önlerken bağımsız arka plan işlerini ve kullanıcı girdisi isteklerini korur.
 
 ## Güncel destek durumu
 

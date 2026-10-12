@@ -26,7 +26,7 @@ enum CodexSource: String, Codable { case desktop, cli, unknown
     var label: String { self == .desktop ? "Codex Desktop" : self == .cli ? "Codex CLI" : "Codex" }
 }
 enum EventKind: String, Codable {
-    case started, reconciledRunning, activity, permissionObserved, userQuestionObserved, requestResolved, completed, failed, interrupted, sessionEnded, dropped, usage, unknownEvent
+    case started, reconciledRunning, activity, permissionObserved, userQuestionObserved, requestResolved, idlePrompt, completed, failed, interrupted, sessionEnded, dropped, usage, unknownEvent
 }
 
 struct CodexUnverifiedCompletion: Codable, Equatable {
@@ -83,10 +83,17 @@ struct CodexEvent: Codable {
     var verifiedHookLease = false
     var trustedInteractionSnapshot: Bool? = nil
     var antigravityStatusline: AntigravityStatuslinePayload? = nil
+    // Claude's Notification hooks do not always carry prompt_id.  This is
+    // metadata only; it is never rendered directly.
+    var notificationType: String? = nil
+    // A non-empty background task/cron list was observed at Claude Stop.
+    // Keep it until a later authoritative terminal event, rather than letting
+    // a prompt-less idle notification forge completion.
+    var claudeBackgroundActive: Bool? = nil
 }
 
 extension CodexEvent {
-    private enum CodingKeys: String, CodingKey { case sessionID, turnID, requestID, kind, source, title, at, id, detail, provider, fidelity, progress, ttl, authToken, requestMatchKey, missingTurnIdentity, projectPath, verifiedEditorHost, transcriptPath, resetAt, runtime, capabilities, requestSnapshot, requestUpdate, requestTurnScope, runtimeState, trustedInteractionSnapshot, antigravityStatusline, navigationTabToken }
+    private enum CodingKeys: String, CodingKey { case sessionID, turnID, requestID, kind, source, title, at, id, detail, provider, fidelity, progress, ttl, authToken, requestMatchKey, missingTurnIdentity, projectPath, verifiedEditorHost, transcriptPath, resetAt, runtime, capabilities, requestSnapshot, requestUpdate, requestTurnScope, runtimeState, trustedInteractionSnapshot, antigravityStatusline, navigationTabToken, notificationType, claudeBackgroundActive }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         sessionID = try c.decode(String.self, forKey: .sessionID)
@@ -118,6 +125,8 @@ extension CodexEvent {
         trustedInteractionSnapshot = try c.decodeIfPresent(Bool.self, forKey: .trustedInteractionSnapshot)
         antigravityStatusline = try c.decodeIfPresent(AntigravityStatuslinePayload.self, forKey: .antigravityStatusline)
         navigationTabToken = TerminalNavigationOrigin.validTabToken(try c.decodeIfPresent(String.self, forKey: .navigationTabToken))
+        notificationType = try c.decodeIfPresent(String.self, forKey: .notificationType)
+        claudeBackgroundActive = try c.decodeIfPresent(Bool.self, forKey: .claudeBackgroundActive)
     }
 }
 
@@ -156,6 +165,7 @@ struct Session: Identifiable, Codable {
     var runtime: RuntimeMetadata? = nil
     var capabilities: RuntimeCapabilities? = nil
     var requestSnapshots: [PendingRequestSnapshot]? = nil
+    var claudeBackgroundActive: Bool? = nil
     // Nil runtime is retained only for legacy Desktop snapshots. Newly parsed
     // rollouts always carry an explicit host, including unknown/conflicting origin.
     var supportsDesktopNativeAttention: Bool {
@@ -558,7 +568,18 @@ struct StateReducer: Codable {
         // Legacy Claude events may keep their session fallback scope, but cannot
         // be associated with an explicitly identified newer prompt.
         if event.provider == .claude, event.missingTurnIdentity == true,
-           let active = sessions[event.sessionID], active.turnID != event.turnID { return false }
+           let active = sessions[event.sessionID], active.turnID != event.turnID {
+            // Claude's documented Notification payloads can omit prompt_id.
+            // The session registry has one current prompt per Claude session;
+            // adopt it only for the two documented notification types and only
+            // while that exact session has a live turn.  This is correlation,
+            // not a fabricated replacement turn.
+            guard ["idle_prompt", "agent_completed"].contains(event.notificationType ?? ""),
+                  active.provider == .claude, active.turnID != active.id,
+                  [.running, .waitingPermission, .waitingUser].contains(active.state),
+                  event.at >= active.started else { return false }
+            event.turnID = active.turnID; event.missingTurnIdentity = false
+        }
         if event.provider == .codex, event.fidelity == .official, event.missingTurnIdentity == true,
            [.permissionObserved, .userQuestionObserved, .requestResolved, .completed, .failed, .interrupted, .sessionEnded].contains(event.kind) {
             // A fresh helper receipt cannot identify which submitted turn ended.
@@ -663,6 +684,7 @@ struct StateReducer: Codable {
             s.projectPath = nil; s.verifiedEditorHost = nil; s.verifiedTerminalHost = nil; s.terminalNavigation = nil; s.editorOriginEvidence = nil; s.providerAttention = nil; s.codexOriginObservation = nil; s.unverifiedCodexCompletion = nil
             s.turnID = event.turnID; s.officiallyEnded = false; s.fidelity = event.fidelity; s.recovered = event.kind == .reconciledRunning; s.state = .running; s.started = event.at; s.seen = false
             s.pending.removeAll(); s.pendingKinds.removeAll(); s.pendingMatchKeys.removeAll(); s.requestSnapshots = nil; s.lastEventIDs.removeAll()
+            s.claudeBackgroundActive = nil
         } else if event.kind != .reconciledRunning && (event.at < s.started || event.at < s.updated) { return false }
         if ([.permissionObserved, .userQuestionObserved, .requestResolved].contains(event.kind)),
            (s.officiallyEnded == true || s.state == .completed || s.state == .failed || s.state == .interrupted) { return false }
@@ -756,6 +778,7 @@ struct StateReducer: Codable {
         case .started:
             s.providerAttention = nil
             s.officiallyEnded = false
+            s.claudeBackgroundActive = nil
             s.state = (event.provider == .signal || s.pending.isEmpty) ? .running : (s.pendingKinds.values.contains(.waitingPermission) ? .waitingPermission : .waitingUser); s.seen = false
             if event.provider == .signal { s.pending.removeAll(); s.pendingKinds.removeAll(); s.pendingMatchKeys.removeAll() }
             if event.ttl == nil { s.expires = nil }
@@ -763,8 +786,12 @@ struct StateReducer: Codable {
         case .reconciledRunning:
             if s.state == .unknown { s.recovered = true; s.state = .running; s.seen = false; s.detail = event.detail ?? "Canlı tur doğrulandı" }
         case .activity:
+            if event.provider == .claude, event.claudeBackgroundActive == true { s.claudeBackgroundActive = true }
             if s.state == .unknown && allowActivityResume { s.state = .running }
-            if s.state == .running, let detail = event.detail { s.detail = detail }
+            if let detail = event.detail,
+               s.state == .running || event.provider == .claude && event.notificationType == "agent_completed" {
+                s.detail = detail
+            }
         case .permissionObserved, .userQuestionObserved:
             if (allowUnverifiedWait || event.fidelity == .official || event.fidelity == .manual), let id = event.requestID {
                 if !(id.hasPrefix("fallback:") && event.provider == .claude && !s.pending.isEmpty) {
@@ -820,7 +847,19 @@ struct StateReducer: Codable {
             }
             if !s.pending.isEmpty { s.state = s.pendingKinds.values.contains(.waitingPermission) ? .waitingPermission : .waitingUser }
             else if resolved != nil && (s.state == .waitingPermission || s.state == .waitingUser) { s.state = .running; s.expires = nil }
-        case .completed: s.unverifiedCodexCompletion = nil; s.state = .completed; s.pending.removeAll(); s.pendingKinds.removeAll(); s.pendingMatchKeys.removeAll(); s.expireRequests(); s.expires = nil; if !terminalReplay { s.seen = false }; s.detail = event.detail ?? "İş tamamlandı"
+        case .idlePrompt:
+            // Claude emits this only after its foreground turn is idle.  Keep
+            // an independently observed unanswered request intact: it can be
+            // from an earlier hook whose resolution event has not arrived yet.
+            // A provider notification must never erase that interaction.
+            guard s.pending.isEmpty, s.claudeBackgroundActive != true else {
+                s.detail = event.detail ?? "Claude boşta bildirimi alındı; bekleyen iş korunuyor"
+                break
+            }
+            s.unverifiedCodexCompletion = nil; s.state = .completed; s.expires = nil
+            if !terminalReplay { s.seen = false }
+            s.detail = event.detail ?? "Yanıt hazır"
+        case .completed: s.unverifiedCodexCompletion = nil; s.claudeBackgroundActive = nil; s.state = .completed; s.pending.removeAll(); s.pendingKinds.removeAll(); s.pendingMatchKeys.removeAll(); s.expireRequests(); s.expires = nil; if !terminalReplay { s.seen = false }; s.detail = event.detail ?? "İş tamamlandı"
         case .failed: s.state = .failed; s.pending.removeAll(); s.pendingKinds.removeAll(); s.pendingMatchKeys.removeAll(); s.expireRequests(); s.expires = nil; if !terminalReplay { s.seen = false }; s.detail = event.detail ?? "İş başarısız oldu"
         case .interrupted: if !terminalReplay { s.seen = false }; s.state = .interrupted; s.pending.removeAll(); s.pendingKinds.removeAll(); s.pendingMatchKeys.removeAll(); s.expireRequests(); s.expires = nil; s.detail = event.detail ?? "Tur kesildi"
         case .sessionEnded:
@@ -1006,7 +1045,7 @@ extension StateReducer {
 }
 
 extension Session {
-    private enum CodingKeys: String, CodingKey { case id, turnID, source, title, detail, state, started, updated, seen, pending, pendingKinds, pendingMatchKeys, lastEventIDs, provider, fidelity, progress, expires, recovered, officiallyEnded, projectPath, verifiedEditorHost, verifiedTerminalHost, terminalNavigation, editorOriginEvidence, editorFocusBlockReason, editorFocusBlockTurnID, providerAttention, codexOriginObservation, unverifiedCodexCompletion, runtime, capabilities, requestSnapshots }
+    private enum CodingKeys: String, CodingKey { case id, turnID, source, title, detail, state, started, updated, seen, pending, pendingKinds, pendingMatchKeys, lastEventIDs, provider, fidelity, progress, expires, recovered, officiallyEnded, projectPath, verifiedEditorHost, verifiedTerminalHost, terminalNavigation, editorOriginEvidence, editorFocusBlockReason, editorFocusBlockTurnID, providerAttention, codexOriginObservation, unverifiedCodexCompletion, runtime, capabilities, requestSnapshots, claudeBackgroundActive }
     func encode(to encoder: Encoder) throws {
         var safe = self; safe.redactInteractionContent()
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -1042,6 +1081,7 @@ extension Session {
         try c.encodeIfPresent(safe.runtime, forKey: .runtime)
         try c.encodeIfPresent(safe.capabilities, forKey: .capabilities)
         try c.encodeIfPresent(safe.requestSnapshots, forKey: .requestSnapshots)
+        try c.encodeIfPresent(safe.claudeBackgroundActive, forKey: .claudeBackgroundActive)
     }
 }
 

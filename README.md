@@ -23,9 +23,9 @@ Three looks, the same status signals. Choose one in Settings → Appearance.
 
 ## Install
 
-**Free beta:** 0.1.8 · macOS 13 or later · Apple Silicon (arm64)
+**Free beta:** 0.1.9 · macOS 13 or later · Apple Silicon (arm64)
 
-**[Download Refik 0.1.8](https://github.com/metapak/Refik/releases/download/v0.1.8/Refik-0.1.8-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.8)
+**[Download Refik 0.1.9](https://github.com/metapak/Refik/releases/download/v0.1.9/Refik-0.1.9-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.9)
 
 1. Open the DMG and drag Refik to **Applications**.
 2. Launch Refik and connect the tools found by the first-launch setup.
@@ -36,11 +36,11 @@ The current build is ad hoc signed and has not been notarized by Apple. macOS ma
 
 For terminal jobs, select Terminal.app or iTerm2 on the activity row when needed. Opening an application does not guarantee selecting a particular chat, window or terminal session.
 
-### 0.1.8 notes
+### 0.1.9 notes
 
-- Claude Code cards no longer take their project label from early session metadata emitted in a child build or report directory. Refik waits for the submitted prompt's `started` event to establish the session's project root and title.
+- Claude Code's documented `idle_prompt` notification now completes the matching foreground terminal turn, including payloads that omit `prompt_id`. Background work and unresolved questions remain active until an authoritative terminal completion event arrives.
 
-This preserves independent names for concurrent Claude sessions and prevents transient child directories such as `Builds` from becoming the displayed project.
+This prevents finished terminal work from remaining in the working state while preserving independent background work and user-input requests.
 
 ## Current support
 

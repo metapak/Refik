@@ -84,6 +84,15 @@ let eventKind: String?
 if provider == "claude", name == "Stop", strictBoolean(object["stop_hook_active"]) == true { exit(0) }
 let claudeInputNotification = provider == "claude" && name == "Notification" &&
     ["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"].contains(object["notification_type"] as? String ?? "")
+let claudeNotificationType = object["notification_type"] as? String ?? ""
+func safeNotificationDetail(_ value: Any?, fallback: String) -> String {
+    guard let raw = value as? String else { return fallback }
+    let cleaned = raw.unicodeScalars.map { scalar -> Character in
+        CharacterSet.controlCharacters.contains(scalar) && scalar != "\n" && scalar != "\t" ? " " : Character(String(scalar))
+    }
+    let collapsed = String(cleaned).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    return collapsed.isEmpty ? fallback : String(collapsed.prefix(240))
+}
 switch (provider, name) {
 case (_, "sessionStart"), (_, "session_start"), (_, "beforeSubmitPrompt"), (_, "pre_user_prompt"), (_, "userPromptSubmitted"), (_, "SessionStart"), (_, "UserPromptSubmit"), (_, "PreInvocation"): eventKind = "started"
 case (_, "afterAgentThought"), (_, "afterAgentResponse"), (_, "afterFileEdit"), (_, "preToolUse"), (_, "pre_run_command"), (_, "pre_mcp_tool_use"), (_, "pre_read_code"), (_, "pre_write_code"), ("antigravity", "PreToolUse"), (_, "PostInvocation"): eventKind = "activity"
@@ -102,7 +111,9 @@ case (_, "Interrupt"): eventKind = "interrupted"
 case (_, "sessionEnd"), (_, "session_end"), (_, "SessionEnd"): eventKind = "sessionEnded"
 case (_, "Notification") where object["notification_type"] as? String == "permission_prompt": eventKind = "permissionObserved"
 case ("claude", "Notification") where claudeInputNotification: eventKind = "userQuestionObserved"
-case ("claude", "Notification") where ["idle_prompt", "auth_success"].contains(object["notification_type"] as? String ?? ""): exit(0)
+case ("claude", "Notification") where claudeNotificationType == "idle_prompt": eventKind = "idlePrompt"
+case ("claude", "Notification") where claudeNotificationType == "agent_completed": eventKind = "activity"
+case ("claude", "Notification") where claudeNotificationType == "auth_success": exit(0)
 default: eventKind = name.isEmpty ? nil : "unknownEvent"
 }
 guard var kind = eventKind else { exit(0) }
@@ -176,6 +187,13 @@ let id = questionTool && request != nil && ["userQuestionObserved", "requestReso
 var payload: [String: Any] = ["sessionID": provider == "codex" ? String(session) : "\(provider):\(session)", "turnID": String(turn), "requestID": request ?? (NSNull() as Any),
     "kind": kind, "source": "unknown", "title": title, "at": stamp, "id": id,
     "provider": provider, "fidelity": "official"]
+if provider == "claude", name == "Notification",
+   ["idle_prompt", "agent_completed"].contains(claudeNotificationType) {
+    payload["notificationType"] = claudeNotificationType
+}
+if provider == "claude", name == "Stop", kind == "activity" {
+    payload["claudeBackgroundActive"] = true
+}
 let exactCwd: String? = {
     if let cwd = object["cwd"] as? String { return cwd }
     let roots = [object["workspacePaths"], object["workspace_roots"]].compactMap { $0 as? [String] }
@@ -193,6 +211,12 @@ if kind == "permissionObserved" && correlation == nil {
 }
 if kind == "userQuestionObserved" {
     payload["detail"] = claudeInputNotification ? "Sağlayıcı kullanıcı girdisi bekliyor; soru ayrıntıları verilmedi" : "Yapılandırılmış kullanıcı sorusu yanıt bekliyor"
+}
+if provider == "claude", name == "Notification", kind == "idlePrompt" {
+    payload["detail"] = safeNotificationDetail(object["message"], fallback: "Yanıt hazır")
+}
+if provider == "claude", name == "Notification", claudeNotificationType == "agent_completed" {
+    payload["detail"] = safeNotificationDetail(object["message"], fallback: "Alt ajan tamamlandı")
 }
 if let requestMatchKey { payload["requestMatchKey"] = requestMatchKey }
 if kind == "unknownEvent" { payload["detail"] = "Bilinmeyen olay: " + String(name.prefix(60)) }
