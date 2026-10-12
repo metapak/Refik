@@ -87,6 +87,17 @@ struct NativeCompletion: Equatable {
     }
 }
 
+// A newer root Desktop turn is sufficient to retire an older Refik result,
+// but it never acknowledges that older result.  This is intentionally kept
+// separate from NativeCompletion: the latest native turn did not complete the
+// Refik turn being retired.
+struct NativeSupersession: Equatable {
+    let thread: String
+    let completedTurn: String
+    let newerTurn: String
+    let newerStarted: Date
+}
+
 struct NativeAttentionCorrelation {
     private var context: NativeAttentionContext?
     private var lastObservation: Date?
@@ -388,5 +399,87 @@ final class NativeAttentionReader {
         }
         guard step == SQLITE_DONE else { return [] }
         return candidates.compactMap { matches[$0.id] }
+    }
+
+    // Read only the latest root Desktop turn. A stale completion can be
+    // retired only when the native store proves a later, terminally distinct
+    // root turn in exactly the same canonical project.  We deliberately do
+    // not infer supersession from an absent unread marker, a changed title,
+    // an archived thread, an agent child, or equal-second timestamps.
+    func verifiedSupersessions(_ sessions: [Session]) -> [NativeSupersession] {
+        let candidates = sessions.filter {
+            $0.provider == .codex && $0.source == .desktop &&
+            $0.supportsDesktopNativeAttention && $0.state == .completed &&
+            !$0.seen && $0.pending.isEmpty && ProjectIdentity.canonical($0.projectPath) != nil
+        }
+        guard !candidates.isEmpty else { return [] }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(root.appendingPathComponent("thread_history_1.sqlite").path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK, let db else {
+            if let db { sqlite3_close(db) }; return []
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 50)
+        var attach: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "ATTACH DATABASE ? AS state", -1, &attach, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(attach) }
+        let uri = "file:" + root.appendingPathComponent("state_5.sqlite").path + "?mode=ro"
+        _ = uri.withCString { sqlite3_bind_text(attach, 1, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+        guard sqlite3_step(attach) == SQLITE_DONE else { return [] }
+        // Bind both identities.  A matching thread alone is insufficient: a
+        // separate completed turn in the same conversation must never retire
+        // this card.
+        let identities = candidates.map { _ in "(old.thread_id=? AND old.turn_id=?)" }.joined(separator: " OR ")
+        let sql = """
+        SELECT old.thread_id,old.turn_id,old.started_at,old.completed_at,
+               newer.turn_id,newer.status,newer.started_at,
+               s.source,s.archived,s.agent_path,s.cwd
+        FROM thread_turns old
+        JOIN state.threads s ON s.id=old.thread_id
+        JOIN thread_turns newer ON newer.thread_id=old.thread_id
+        WHERE (\(identities))
+          AND old.status='completed' AND old.completed_at IS NOT NULL
+          AND (newer.started_at>old.started_at OR newer.rollout_ordinal>old.rollout_ordinal)
+          AND newer.started_at>old.completed_at
+          AND NOT EXISTS (SELECT 1 FROM thread_turns later WHERE later.thread_id=newer.thread_id
+            AND (later.started_at>newer.started_at OR later.rollout_ordinal>newer.rollout_ordinal))
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        for (index, session) in candidates.enumerated() {
+            let first = Int32(index * 2 + 1)
+            _ = session.id.withCString { sqlite3_bind_text(stmt, first, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+            _ = session.turnID.withCString { sqlite3_bind_text(stmt, first + 1, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+        }
+        func field(_ column: Int32) -> String { sqlite3_column_text(stmt, column).map { String(cString: $0) } ?? "" }
+        var results: [NativeSupersession] = []
+        var encountered = Set<String>()
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            let thread = field(0), completedTurn = field(1), newerTurn = field(4), status = field(5)
+            // Multiple matching prior rows or equally latest rows cannot
+            // establish one exact successor.
+            guard encountered.insert(thread).inserted else { return [] }
+            guard let session = candidates.first(where: { $0.id == thread }),
+                  completedTurn == session.turnID,
+                  newerTurn != session.turnID,
+                  ["inProgress", "running", "interrupted", "failed", "completed"].contains(status),
+                  field(7) == "vscode", sqlite3_column_int(stmt, 8) == 0, field(9).isEmpty,
+                  let root = ProjectIdentity.canonical(session.projectPath),
+                  let nativeRoot = ProjectIdentity.canonical(URL(fileURLWithPath: field(10)).standardizedFileURL.path),
+                  root == nativeRoot else { step = sqlite3_step(stmt); continue }
+            let newerStarted = Date(timeIntervalSince1970: Double(sqlite3_column_int64(stmt, 6)))
+            // SQLite stores whole seconds. A successor must begin after the
+            // exact old native completion, and it must also be later than the
+            // Refik observation. Equal-second ordering is ambiguous, so
+            // preserve the old result until a later generation is proven.
+            guard newerStarted.timeIntervalSince1970 > floor(session.updated.timeIntervalSince1970),
+                  newerStarted > session.started else { step = sqlite3_step(stmt); continue }
+            results.append(NativeSupersession(thread: thread, completedTurn: session.turnID,
+                                              newerTurn: newerTurn, newerStarted: newerStarted))
+            step = sqlite3_step(stmt)
+        }
+        guard step == SQLITE_DONE else { return [] }
+        return results
     }
 }

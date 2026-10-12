@@ -23,9 +23,9 @@ Three looks, the same status signals. Choose one in Settings → Appearance.
 
 ## Install
 
-**Free beta:** 0.1.6 · macOS 13 or later · Apple Silicon (arm64)
+**Free beta:** 0.1.7 · macOS 13 or later · Apple Silicon (arm64)
 
-**[Download Refik 0.1.6](https://github.com/metapak/Refik/releases/download/v0.1.6/Refik-0.1.6-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.6)
+**[Download Refik 0.1.7](https://github.com/metapak/Refik/releases/download/v0.1.7/Refik-0.1.7-macOS-arm64.dmg)** · [Beta release notes](https://github.com/metapak/Refik/releases/tag/v0.1.7)
 
 1. Open the DMG and drag Refik to **Applications**.
 2. Launch Refik and connect the tools found by the first-launch setup.
@@ -36,6 +36,12 @@ The current build is ad hoc signed and has not been notarized by Apple. macOS ma
 
 For terminal jobs, select Terminal.app or iTerm2 on the activity row when needed. Opening an application does not guarantee selecting a particular chat, window or terminal session.
 
+### 0.1.7 notes
+
+- A completed Codex Desktop card is retired only when Refik can prove a newer root turn in the exact same local project. The older result remains unseen; unrelated, archived or ambiguous turns cannot dismiss it.
+- Claude Code `Stop` events with omitted optional background-task fields now finish a terminal job. Explicitly reported background work keeps it working. If a provider never sends its final event, Refik keeps the job active rather than guessing that it ended.
+- Usage rows name their time window and mark derived local values. They describe a local snapshot only; Refik cannot read or change your account quota.
+
 ## Current support
 
 This table separates live usage checks from implemented integrations that still need live validation.
@@ -44,7 +50,7 @@ This table separates live usage checks from implemented integrations that still 
 | --- | --- | --- |
 | Codex · Visual Studio Code | Working, waiting and ready states; opening the editor | Live checked |
 | Codex CLI · Terminal.app / iTerm2 | Working, waiting and ready states; opening the configured terminal | Live checked |
-| Codex Desktop | Activity tracking and opening the app | Exact native completion/read proof checked on the installed 0.1.5 build; exact-chat navigation is unverified |
+| Codex Desktop | Activity tracking and opening the app | Native stale-completion retirement is covered by local regression tests; exact-chat navigation is unverified |
 | Antigravity IDE | Working, waiting and ready states; opening the IDE | Live checked |
 | Antigravity CLI · Terminal.app / iTerm2 | Working, waiting and ready states; opening the configured terminal | Live checked |
 | Cursor · Grok | Notification flow | Live checked for notifications; question and opening flows are not fully validated |

@@ -261,6 +261,73 @@ final class NativeAttentionTests: XCTestCase {
             }
         }
     }
+    func testNewerNativeRootTurnRetiresOnlyExactStaleDesktopCompletionWithoutMarkingSeen() throws {
+        try fixture { root in
+            var history: OpaquePointer?, database: OpaquePointer?
+            sqlite3_open(root.appendingPathComponent("thread_history_1.sqlite").path, &history)
+            sqlite3_open(root.appendingPathComponent("state_5.sqlite").path, &database)
+            defer { sqlite3_close(history); sqlite3_close(database) }
+            let project = root.appendingPathComponent("project")
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            XCTAssertEqual(sqlite3_exec(history, "CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('a','turn','completed',800,900,1); INSERT INTO thread_turns VALUES('a','new','interrupted',950,NULL,2)", nil, nil, nil), SQLITE_OK)
+            XCTAssertEqual(sqlite3_exec(database, "CREATE TABLE threads(id TEXT,source TEXT,archived INTEGER,agent_path TEXT,cwd TEXT); INSERT INTO threads VALUES('a','vscode',0,NULL,'\(project.path)')", nil, nil, nil), SQLITE_OK)
+            var session = completion(); session.projectPath = project.path
+            let reader = NativeAttentionReader(root: root)
+            var mismatchedTurn = session; mismatchedTurn.turnID = "not-native-turn"
+            XCTAssertTrue(reader.verifiedSupersessions([mismatchedTurn]).isEmpty,
+                          "a different completed turn in the same thread cannot supersede this card")
+            let exact = try XCTUnwrap(reader.verifiedSupersessions([session]).first)
+            XCTAssertEqual(exact.thread, "a"); XCTAssertEqual(exact.completedTurn, "turn")
+            XCTAssertEqual(exact.newerTurn, "new")
+
+            // A later rollout ordinal alone is not enough when the candidate
+            // turn began before the exact older native completion.
+            XCTAssertEqual(sqlite3_exec(history, "UPDATE thread_turns SET completed_at=1000 WHERE turn_id='turn'", nil, nil, nil), SQLITE_OK)
+            XCTAssertTrue(reader.verifiedSupersessions([session]).isEmpty,
+                          "an overlapping successor cannot retire a still-completing turn")
+            XCTAssertEqual(sqlite3_exec(history, "UPDATE thread_turns SET completed_at=900 WHERE turn_id='turn'", nil, nil, nil), SQLITE_OK)
+
+            var reducer = StateReducer(sessions: ["a": session])
+            XCTAssertTrue(reducer.retireNativeSuperseded([exact], at: now))
+            XCTAssertNil(reducer.sessions["a"])
+            let archived = try XCTUnwrap(reducer.nativeDismissalHistory?.last)
+            XCTAssertEqual(archived.reason, "codex-native-newer-turn-superseded")
+            XCTAssertFalse(archived.session.seen, "supersession is never an acknowledgement")
+
+            // Old native unread state and a replay of the old turn cannot make
+            // the retired card reappear. A genuine newer lifecycle event is
+            // handled by the normal session replacement path instead.
+            let observations = NativeAttentionMirror.observations(NativeAttentionSnapshot(context: context(), unread: ["a"], observedAt: now), completions: [NativeCompletion(session)], at: now)
+            XCTAssertFalse(reducer.reconcileProviderAttention(observations, at: now))
+            let stale = CodexEvent(sessionID: "a", turnID: "turn", requestID: nil, kind: .completed, source: .desktop,
+                                   title: "Same project", at: now, id: "stale")
+            XCTAssertFalse(reducer.apply(stale))
+
+            for update in ["archived=1", "archived=0,agent_path='/child'", "agent_path=NULL,cwd='/tmp/other'"] {
+                sqlite3_exec(database, "UPDATE threads SET \(update)", nil, nil, nil)
+                XCTAssertTrue(reader.verifiedSupersessions([session]).isEmpty, update)
+            }
+        }
+    }
+    func testNewerNativeRootTurnRequiresUnambiguousLaterChronologyAndAllowedState() throws {
+        try fixture { root in
+            var history: OpaquePointer?, database: OpaquePointer?
+            sqlite3_open(root.appendingPathComponent("thread_history_1.sqlite").path, &history)
+            sqlite3_open(root.appendingPathComponent("state_5.sqlite").path, &database)
+            defer { sqlite3_close(history); sqlite3_close(database) }
+            let project = root.appendingPathComponent("project")
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            XCTAssertEqual(sqlite3_exec(history, "CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('a','turn','completed',800,900,1); INSERT INTO thread_turns VALUES('a','new','inProgress',900,NULL,2)", nil, nil, nil), SQLITE_OK)
+            XCTAssertEqual(sqlite3_exec(database, "CREATE TABLE threads(id TEXT,source TEXT,archived INTEGER,agent_path TEXT,cwd TEXT); INSERT INTO threads VALUES('a','vscode',0,NULL,'\(project.path)')", nil, nil, nil), SQLITE_OK)
+            var session = completion(); session.projectPath = project.path
+            let reader = NativeAttentionReader(root: root)
+            XCTAssertTrue(reader.verifiedSupersessions([session]).isEmpty, "same-second successor is ambiguous")
+            sqlite3_exec(history, "UPDATE thread_turns SET started_at=950,status='unknown' WHERE turn_id='new'", nil, nil, nil)
+            XCTAssertTrue(reader.verifiedSupersessions([session]).isEmpty, "unknown native status is not a lifecycle proof")
+            sqlite3_exec(history, "UPDATE thread_turns SET status='running' WHERE turn_id='new'", nil, nil, nil)
+            XCTAssertEqual(reader.verifiedSupersessions([session]).first?.newerTurn, "new")
+        }
+    }
     private func rollout(_ root: URL, origin: String = "codex_work_desktop", parent: Bool = false) throws -> URL {
         let url = root.appendingPathComponent("root.jsonl")
         var metadata: [String: Any] = ["id": "a", "cwd": "/tmp/project", "source": "vscode", "originator": origin]

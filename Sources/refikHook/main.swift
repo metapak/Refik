@@ -124,10 +124,17 @@ if provider == "antigravity", name == "Stop" {
     // neither is used as a fabricated shared turn identity.
 }
 if provider == "claude", name == "Stop" {
-    let tasks = object["background_tasks"] as? [Any]
-    let crons = object["session_crons"] as? [Any]
-    if tasks == nil || crons == nil { kind = "sessionEnded" }
-    else if !(tasks?.isEmpty ?? true) || !(crons?.isEmpty ?? true) { kind = "activity" }
+    // Stop is Claude Code's documented final-response event. Some supported
+    // releases omit the optional background arrays entirely; absence is not
+    // evidence of an unfinished turn. A present malformed value is not an
+    // empty array, so it remains conservative activity rather than forging a
+    // completion from untrusted hook input.
+    func absentOrEmptyArray(_ key: String) -> Bool {
+        guard let value = object[key] else { return true }
+        guard let values = value as? [Any] else { return false }
+        return values.isEmpty
+    }
+    if !absentOrEmptyArray("background_tasks") || !absentOrEmptyArray("session_crons") { kind = "activity" }
 }
 // PermissionRequest has no tool_use_id in the published Codex and Claude schemas.
 // Never merge two such prompts or clear one from an unrelated tool event.

@@ -343,6 +343,29 @@ struct StateReducer: Codable {
         return changed
     }
 
+    // A native successor changes what is current; it is not evidence that the
+    // user saw the older outcome. Keep the full, unseen result in the bounded
+    // history so a later stale hook cannot recreate it, while removing its
+    // obsolete attention card from the working registry.
+    @discardableResult mutating func retireNativeSuperseded(_ supersessions: [NativeSupersession], at now: Date) -> Bool {
+        var changed = false
+        for successor in supersessions {
+            guard let session = sessions[successor.thread], session.provider == .codex,
+                  session.source == .desktop, session.supportsDesktopNativeAttention,
+                  session.state == .completed, !session.seen, session.pending.isEmpty,
+                  session.turnID == successor.completedTurn,
+                  successor.newerTurn != session.turnID,
+                  successor.newerStarted.timeIntervalSince1970 > floor(session.updated.timeIntervalSince1970),
+                  successor.newerStarted > session.started else { continue }
+            var history = nativeDismissalHistory ?? []
+            history.append(NativeDismissal(session: session, at: now, reason: "codex-native-newer-turn-superseded"))
+            nativeDismissalHistory = Array(history.suffix(100))
+            sessions.removeValue(forKey: session.id)
+            changed = true
+        }
+        return changed
+    }
+
     @discardableResult mutating func associateProject(_ event: CodexEvent) -> Bool {
         guard let path = ProjectIdentity.canonical(event.projectPath),
               let session = sessions[event.sessionID], session.provider == event.provider,

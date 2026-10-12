@@ -288,7 +288,10 @@ final class EditorFocusTests: XCTestCase {
                 guard let payload = HookWire.receive(peer, requireNewline: true, deadline: HookWire.uptime + 2),
                       let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else { XCTFail(); return }
                 XCTAssertEqual(object["sessionID"] as? String, "claude:receipt-qa")
-                XCTAssertEqual(object["kind"] as? String, "sessionEnded")
+                // Claude's Stop payload may omit its optional background arrays.  The
+                // documented final event remains a completion in that case; only an
+                // explicitly non-empty array keeps the session active.
+                XCTAssertEqual(object["kind"] as? String, "completed")
                 XCTAssertTrue(HookWire.send(HookFrame(type: "origin-captured"), fd: peer))
                 XCTAssertNil(HookWire.receive(peer, deadline: HookWire.uptime + 2), "helper closes after bounded receipt without extra payload")
                 delivered.fulfill()

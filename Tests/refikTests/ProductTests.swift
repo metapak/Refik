@@ -267,7 +267,19 @@ final class ProductTests: XCTestCase {
         XCTAssertEqual(try normalizeHook(payload)?["kind"] as? String, "activity")
         payload["background_tasks"] = []; payload["session_crons"] = [["id": "scheduled"]]
         XCTAssertEqual(try normalizeHook(payload)?["kind"] as? String, "activity")
-        XCTAssertEqual(try normalizeHook(base)?["kind"] as? String, "sessionEnded")
+        XCTAssertEqual(try normalizeHook(base)?["kind"] as? String, "completed", "optional background arrays are not required by Claude Stop")
+        for malformed in [NSNull(), "not-an-array", ["id": "not-an-array"]] as [Any] {
+            payload = base; payload["background_tasks"] = malformed
+            XCTAssertEqual(try normalizeHook(payload)?["kind"] as? String, "activity", "malformed present task data cannot complete Stop")
+            payload = base; payload["session_crons"] = malformed
+            XCTAssertEqual(try normalizeHook(payload)?["kind"] as? String, "activity", "malformed present cron data cannot complete Stop")
+        }
+        payload = base; payload["stop_hook_active"] = true
+        XCTAssertNil(try normalizeHook(payload), "only exact true suppresses the continuation Stop")
+        for nonContinuation in [false, "true", 1, NSNull()] as [Any] {
+            payload = base; payload["stop_hook_active"] = nonContinuation
+            XCTAssertEqual(try normalizeHook(payload)?["kind"] as? String, "completed")
+        }
     }
     func testDesktopSessionWithoutTurnDoesNotInventActiveAndKnownTurnKeepsIdentity() throws {
         let threadOnly: [String: Any] = ["session_id": "desktop-thread", "cwd": "/tmp/project"]

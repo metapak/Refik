@@ -162,13 +162,13 @@ final class MigrationTests: XCTestCase {
         }
     }
     func testWeeklyRemainingAndOtherWindowsPreserveExplicitSemantics() {
-        for (used, expected) in [(0.0, "~%100 kaldı"), (72.0, "~%28 kaldı"), (100.0, "~%0 kaldı")] {
+        for (used, expected) in [(0.0, "~%0 kullanıldı · yerel kayıt"), (72.0, "~%72 kullanıldı · yerel kayıt"), (100.0, "~%100 kullanıldı · yerel kayıt")] {
             let entry = UsageEntry(provider: .codex, window: "7 gün", percent: used, fidelity: .derived, expires: .distantFuture, semantic: .used)
             XCTAssertEqual(entry.valueLabel, expected)
         }
         let unknown = UsageEntry(provider: .codex, window: "7 gün", percent: 72, fidelity: .derived, expires: .distantFuture)
         XCTAssertEqual(unknown.valueLabel, "Türetilmiş veri")
         let alreadyRemaining = UsageEntry(provider: .codex, window: "7 gün", percent: 28, fidelity: .derived, expires: .distantFuture, semantic: .remaining)
-        XCTAssertEqual(alreadyRemaining.valueLabel, "~%28 kaldı")
+        XCTAssertEqual(alreadyRemaining.valueLabel, "~%28 kaldı · yerel kayıt")
     }
 }

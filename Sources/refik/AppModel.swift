@@ -76,13 +76,12 @@ struct UsageEntry: Identifiable {
     var resetAt: Date? = nil
     func providerLabel(at now: Date) -> String {
         let countdown = UsageFormatting.resetCountdown(until: resetAt, at: now)
-        return provider.label + (countdown.map { " · \($0)" } ?? "")
+        return provider.label + " · " + window + (countdown.map { " · \($0)" } ?? "")
     }
     var valueLabel: String {
         guard semantic != .unknown else { return "Türetilmiş veri" }
-        let weeklyUsed = window == UsageFormatting.duration(minutes: 10_080) && semantic == .used
-        let value = weeklyUsed ? 100 - percent : percent
-        return "\(fidelity == .derived ? "~" : "")%\(Int(value.rounded())) \(semantic == .used && !weeklyUsed ? "kullanıldı" : "kaldı")"
+        let source = fidelity == .derived ? " · yerel kayıt" : ""
+        return "\(fidelity == .derived ? "~" : "")%\(Int(percent.rounded())) \(semantic == .used ? "kullanıldı" : "kaldı")\(source)"
     }
 }
 
@@ -754,12 +753,24 @@ struct UsageEntry: Identifiable {
     }
     private func reconcileNativeAttention(at now: Date) {
         guard let reader = nativeAttentionReader else { return }
-        let snapshot = reader.snapshot(now: now)
         let candidates = reducer.providerAttentionCandidates.filter {
             $0.supportsDesktopNativeAttention && $0.state == .completed && !$0.seen
         }
-        let sessionIDs = Set(candidates.map(\.id))
-        let verified = snapshot == nil ? [] : reader.verifiedCompletions(candidates, rolloutProofs: watcher?.completionProofs(sessionIDs: sessionIDs) ?? [])
+        // A newer native root turn retires an older result card without
+        // claiming the earlier result was seen. This does not depend on the
+        // unread mirror: it is a separate, read-only chronology proof.
+        var superseded = reducer
+        if superseded.retireNativeSuperseded(reader.verifiedSupersessions(candidates), at: now) {
+            // The state archive is part of the decision. If it cannot persist,
+            // leave the visible prior registry untouched.
+            guard commitDismissal(superseded) else { return }
+        }
+        let snapshot = reader.snapshot(now: now)
+        let remaining = reducer.providerAttentionCandidates.filter {
+            $0.supportsDesktopNativeAttention && $0.state == .completed && !$0.seen
+        }
+        let sessionIDs = Set(remaining.map(\.id))
+        let verified = snapshot == nil ? [] : reader.verifiedCompletions(remaining, rolloutProofs: watcher?.completionProofs(sessionIDs: sessionIDs) ?? [])
         let currentProofs = watcher?.completionProofs(sessionIDs: sessionIDs) ?? []
         let completions = verified.filter { completion in
             completion.proofGeneration == nil || currentProofs.contains { completion.matches($0) }

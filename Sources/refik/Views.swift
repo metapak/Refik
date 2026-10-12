@@ -46,6 +46,7 @@ struct StatusPanelView: View {
             Rectangle().fill(Color.white.opacity(0.11)).frame(height: 1)
             VStack(alignment: .leading, spacing: 5) {
                 Text("KULLANIM").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                Text("Son yerel kayıt; hesap kotasını değiştirmez.").font(.system(size: 9)).foregroundStyle(.secondary)
                 if let message = model.usageUnavailableMessage() {
                     Text(message).font(.system(size: 10)).foregroundStyle(.secondary)
                 }

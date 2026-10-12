@@ -99,13 +99,13 @@ final class AttentionTests: XCTestCase {
         XCTAssertEqual(entry.valueLabel, "Türetilmiş veri")
         XCTAssertFalse(entry.valueLabel.contains("83"))
         entry.semantic = .used
-        XCTAssertEqual(entry.valueLabel, "~%17 kaldı")
+        XCTAssertEqual(entry.valueLabel, "~%83 kullanıldı · yerel kayıt")
         entry.semantic = .remaining
-        XCTAssertEqual(entry.valueLabel, "~%83 kaldı")
+        XCTAssertEqual(entry.valueLabel, "~%83 kaldı · yerel kayıt")
         let official = UsageEntry(provider: .codex, window: "7 gün", percent: 83, fidelity: .official, expires: .distantFuture, semantic: .used)
-        XCTAssertEqual(official.valueLabel, "%17 kaldı")
+        XCTAssertEqual(official.valueLabel, "%83 kullanıldı")
         let hourly = UsageEntry(provider: .codex, window: "5 saat", percent: 83, fidelity: .derived, expires: .distantFuture, semantic: .used)
-        XCTAssertEqual(hourly.valueLabel, "~%83 kullanıldı")
+        XCTAssertEqual(hourly.valueLabel, "~%83 kullanıldı · yerel kayıt")
     }
     @MainActor func testFallbackApplicationOpenPreservesEveryResult() {
         let app = AppModel(inspectNotificationPermission: false)

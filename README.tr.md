@@ -23,9 +23,9 @@ Kullanılabilen özellikler araca ve bağlantı biçimine göre değişir. Her a
 
 ## Kurulum
 
-**Ücretsiz beta:** 0.1.6 · macOS 13 ve üzeri · Apple Silicon (arm64)
+**Ücretsiz beta:** 0.1.7 · macOS 13 ve üzeri · Apple Silicon (arm64)
 
-**[Refik 0.1.6 indir](https://github.com/metapak/Refik/releases/download/v0.1.6/Refik-0.1.6-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.6)
+**[Refik 0.1.7 indir](https://github.com/metapak/Refik/releases/download/v0.1.7/Refik-0.1.7-macOS-arm64.dmg)** · [Beta sürüm notları](https://github.com/metapak/Refik/releases/tag/v0.1.7)
 
 1. DMG’yi açın, Refik’i **Applications / Uygulamalar** klasörüne taşıyın.
 2. Refik’i başlatıp ilk kurulumda bulunan araçları bağlayın.
@@ -36,6 +36,12 @@ Mevcut paket ad hoc imzalıdır; Apple noter onayı yoktur. macOS, doğrulanmam�
 
 Terminal işleri için gerektiğinde ilgili satırdan Terminal.app veya iTerm2’yi seçin. Uygulamayı açmak, her araçta belirli bir sohbeti, pencereyi veya terminal oturumunu doğrudan seçmek anlamına gelmez.
 
+### 0.1.7 notları
+
+- Tamamlanmış bir Codex Desktop kartı, yalnızca aynı yerel projede daha yeni bir kök tur kesin olarak doğrulanırsa kaldırılır. Eski sonuç görüldü yapılmaz; ilgisiz, arşivlenmiş veya belirsiz turlar kartı kapatamaz.
+- Claude Code’un isteğe bağlı arka plan iş alanlarını göndermediği `Stop` olayları artık terminal işini tamamlar. Açıkça bildirilen arka plan işi varsa kart çalışıyor kalır. Sağlayıcı son olayı hiç göndermezse Refik tahminde bulunmaz ve işi etkin tutar.
+- Kullanım satırları zaman penceresini gösterir ve yerel kayıttan türetilen değerleri işaretler. Bu değer yalnızca yerel bir kayıttır; Refik hesap kotanızı okuyamaz veya değiştiremez.
+
 ## Güncel destek durumu
 
 Bu tablo, canlı kullanımda denenen akışları henüz gerçek hesapla doğrulanmayan entegrasyonlardan ayırır.
@@ -44,7 +50,7 @@ Bu tablo, canlı kullanımda denenen akışları henüz gerçek hesapla doğrula
 | --- | --- | --- |
 | Codex · Visual Studio Code | Çalışıyor, bekliyor ve yanıt hazır durumları; editörü açma | Canlı denendi |
 | Codex CLI · Terminal.app / iTerm2 | Çalışıyor, bekliyor ve yanıt hazır durumları; seçilen terminali açma | Canlı denendi |
-| Codex Desktop | Etkinlik takibi ve uygulamayı açma | Kurulu 0.1.5 paketinde tam eşleşen yerel tamamlanma/görüldü kanıtı kontrol edildi; belirli sohbete doğrudan geçiş doğrulanmadı |
+| Codex Desktop | Etkinlik takibi ve uygulamayı açma | Yerel gerileme testleri eski tamamlanma kartının güvenli kaldırılmasını kapsar; belirli sohbete doğrudan geçiş doğrulanmadı |
 | Antigravity IDE | Çalışıyor, bekliyor ve yanıt hazır durumları; IDE’yi açma | Canlı denendi |
 | Antigravity CLI · Terminal.app / iTerm2 | Çalışıyor, bekliyor ve yanıt hazır durumları; seçilen terminali açma | Canlı denendi |
 | Cursor · Grok | Bildirim akışı | Bildirim canlı denendi; soru ve açma akışları tam doğrulanmadı |

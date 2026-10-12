@@ -28,8 +28,8 @@ final class UsageTests: XCTestCase {
             XCTAssertLessThan(events.first!.at, now)
             let app = AppModel(inspectNotificationPermission: false)
             app.accept(events[0], historical: false)
-            XCTAssertEqual(app.currentUsageWindows().first?.valueLabel, "~%7 kaldı")
-            XCTAssertEqual(app.currentUsageWindows().first?.providerLabel(at: now), "Codex · 2 gün 10 saat kaldı")
+            XCTAssertEqual(app.currentUsageWindows().first?.valueLabel, "~%93 kullanıldı · yerel kayıt")
+            XCTAssertEqual(app.currentUsageWindows().first?.providerLabel(at: now), "Codex · 7 gün · 2 gün 10 saat kaldı")
             XCTAssertNil(app.usageUnavailableMessage())
             let expiry = events[0].at.addingTimeInterval(events[0].ttl!)
             // Both views suppress expired values even before the pruning timer fires.
@@ -109,8 +109,8 @@ final class UsageTests: XCTestCase {
         XCTAssertNil(label(-1))
         XCTAssertNil(UsageFormatting.resetCountdown(until: nil, at: now))
         let entry = UsageEntry(provider: .claude, window: "7 gün", percent: 93, fidelity: .official, expires: .distantFuture, semantic: .used)
-        XCTAssertEqual(entry.providerLabel(at: now), "Claude")
-        XCTAssertEqual(entry.valueLabel, "%7 kaldı")
+        XCTAssertEqual(entry.providerLabel(at: now), "Claude · 7 gün")
+        XCTAssertEqual(entry.valueLabel, "%93 kullanıldı")
     }
     @MainActor func testUsageTimerRefreshesCountdownWithoutChangingFreshnessOrPercentage() {
         let app = AppModel(inspectNotificationPermission: false), now = Date()
@@ -119,10 +119,10 @@ final class UsageTests: XCTestCase {
         app.accept(event, historical: false)
         let entry = app.currentUsageWindows()[0]
         XCTAssertEqual(entry.expires, now.addingTimeInterval(86_400))
-        XCTAssertEqual(entry.providerLabel(at: now), "Claude · 3 gün kaldı")
+        XCTAssertEqual(entry.providerLabel(at: now), "Claude · 7 gün · 3 gün kaldı")
         app.expire(at: now.addingTimeInterval(3_600))
-        XCTAssertEqual(entry.providerLabel(at: app.usageUpdatedAt), "Claude · 2 gün 23 saat kaldı")
-        XCTAssertEqual(app.currentUsageWindows()[0].valueLabel, "%7 kaldı")
+        XCTAssertEqual(entry.providerLabel(at: app.usageUpdatedAt), "Claude · 7 gün · 2 gün 23 saat kaldı")
+        XCTAssertEqual(app.currentUsageWindows()[0].valueLabel, "%93 kullanıldı")
         XCTAssertEqual(app.currentUsageWindows()[0].expires, entry.expires)
     }
     func testOptionalResetDateRoundTripsAndOldEventsStillDecode() throws {
